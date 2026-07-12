@@ -2,8 +2,7 @@
 /*
 
 # Keep only project source directories and required configuration files.
-!/.vscode/
-!/.vscode/**
+# NOTE: .vscode/ is intentionally ignored to avoid syncing personal IDE settings.
 !/include/
 !/include/**
 !/lib/
