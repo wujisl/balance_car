@@ -165,7 +165,7 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,1,%lu,%lu,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%.5f,%.5f,%.3f,%.3f\\n",
+      "T,1,%lu,%lu,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%.5f,%.5f,%.3f,%.3f\n",
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -379,7 +379,7 @@ void WifiDebugServer::sendReply(uint32_t requestSequence, const char *status, co
     return;
   }
   char reply[64] = {};
-  const int length = snprintf(reply, sizeof(reply), "A,%lu,%s,%s\\n",
+  const int length = snprintf(reply, sizeof(reply), "A,%lu,%s,%s\n",
                               static_cast<unsigned long>(requestSequence), status, reason);
   if (length <= 0 || length >= static_cast<int>(sizeof(reply)))
   {
