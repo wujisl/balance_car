@@ -128,14 +128,14 @@ constexpr AttitudeConfiguration kAttitudeConfiguration = {
 constexpr BalanceConfiguration kBalanceConfiguration = {
     .controlPeriodMs = 5,
     // Initial mechanical-balance trim measured on the assembled vehicle.
-    .targetPitchDegrees = -2.25F,
+    .targetPitchDegrees = -2.24F,
     .proportionalGain = 0.15F,
     // Start tuning with P-D control only. Enable a small Ki only after the
     // mechanical trim has been verified on the actual vehicle.
     .integralGain = 0.0F,
     .derivativeGain = 0.003F,
     .integralLimit = 5000.0F,
-    .maximumMotorCommand = 0.40F,
+    .maximumMotorCommand = 0.55F,
     .motorOutputInverted = false,
 };
 

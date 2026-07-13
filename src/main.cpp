@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/flight_logger.h"
 #include "app/offline_arm_control.h"
 #include "app/safety_manager.h"
 #include "app/self_test.h"
@@ -44,6 +45,7 @@ balance_car::app::SafetyManager safetyManager(
     motorDriver, balance_car::config::kSafetyConfiguration);
 balance_car::app::OfflineArmControl offlineArmControl(
     balance_car::config::kBalanceArmButtonPin, balance_car::config::kSafetyConfiguration.offlineArmHoldMs);
+balance_car::app::FlightLogger flightLogger;
 
 balance_car::drivers::ImuSample latestImuSample = {};
 balance_car::drivers::WheelSpeed latestWheelSpeed = {};
@@ -56,6 +58,7 @@ uint32_t lastVelocityUpdateMs = 0;
 uint32_t lastTelemetryMs = 0;
 char serialCommandBuffer[kSerialCommandCapacity] = {};
 size_t serialCommandLength = 0;
+bool autoBalanceStartPending = false;
 
 void printHelp()
 {
@@ -64,7 +67,8 @@ void printHelp()
   Serial.println("[CMD] set balance kp|ki|kd|trim <value>");
   Serial.println("[CMD] set speed kp|ki|target|invert <value>");
   Serial.println("[CMD] set motion speed|turn <value>");
-  Serial.println("[CMD] Hold BOOT for 1.5 seconds in STANDBY to arm offline balance; press BOOT while balancing to stop.");
+  Serial.println("[CMD] log status|dump|clear (dump and clear require the motors to be stopped)");
+  Serial.println("[CMD] After reset and self-test, balance starts automatically when the IMU sample is valid; press BOOT while balancing to stop.");
 }
 
 void printStatus()
@@ -108,6 +112,31 @@ void printMotionCommand()
   Serial.println(motionCommand.turnCommand(), 3);
 }
 
+void appendFlightLogSample()
+{
+  const balance_car::control::BalanceState &balanceState = balanceController.state();
+  balance_car::app::FlightLogSample sample = {};
+  sample.timestampMs = latestImuSample.timestampMs;
+  sample.pitchDegrees = latestAttitude.pitchDegrees;
+  sample.accelerometerPitchDegrees = latestAttitude.accelerometerPitchDegrees;
+  sample.pitchRateDps = latestAttitude.pitchRateDps;
+  sample.requestedPitchDegrees = balanceState.requestedPitchDegrees;
+  sample.pitchErrorDegrees = balanceState.pitchErrorDegrees;
+  sample.proportionalTerm = balanceState.proportionalTerm;
+  sample.integralTerm = balanceState.integralTerm;
+  sample.derivativeTerm = balanceState.derivativeTerm;
+  sample.unclampedBalanceCommand = balanceState.unclampedMotorCommand;
+  sample.balanceCommand = balanceState.motorCommand;
+  sample.leftMotorCommand = latestMixedMotorCommand.left;
+  sample.rightMotorCommand = latestMixedMotorCommand.right;
+  sample.leftSpeedMps = latestWheelSpeed.leftMetersPerSecond;
+  sample.rightSpeedMps = latestWheelSpeed.rightMetersPerSecond;
+  sample.safetyState = static_cast<uint8_t>(safetyManager.state());
+  sample.faultCode = static_cast<uint8_t>(safetyManager.faultCode());
+  sample.outputSaturated = balanceState.outputSaturated ? 1U : 0U;
+  flightLogger.append(sample);
+}
+
 void requestMotorTest(float leftPower, float rightPower)
 {
   if (safetyManager.requestManualMotorTest(leftPower, rightPower, millis()))
@@ -127,6 +156,7 @@ void requestBalance()
     motionCommand.clear();
     latestBalanceMotorCommand = 0.0F;
     latestVelocityPitchOffsetDegrees = 0.0F;
+    flightLogger.startSession();
     Serial.println("[BALANCE] STATE=ACTIVE");
     return;
   }
@@ -136,12 +166,17 @@ void requestBalance()
 void stopMotorOutput()
 {
   safetyManager.disarm();
+  const bool logSaved = flightLogger.saveSession();
   balanceController.reset();
   velocityController.reset();
   motionCommand.clear();
   latestBalanceMotorCommand = 0.0F;
   latestVelocityPitchOffsetDegrees = 0.0F;
   latestMixedMotorCommand = {};
+  if (!logSaved)
+  {
+    Serial.println("[LOG] SAVE=FAILED");
+  }
 }
 
 void applyTuningCommand(const char *domain, const char *parameter, float value)
@@ -288,6 +323,31 @@ void processSingleCharacterCommand(char command)
   }
 }
 
+void processLogCommand(const char *action)
+{
+  if (strcmp(action, "status") == 0)
+  {
+    flightLogger.printStatus(Serial);
+    return;
+  }
+  if (safetyManager.isBalancing())
+  {
+    Serial.println("[LOG] REJECTED_WHILE_BALANCING");
+    return;
+  }
+  if (strcmp(action, "dump") == 0)
+  {
+    flightLogger.dumpCsv(Serial);
+    return;
+  }
+  if (strcmp(action, "clear") == 0)
+  {
+    Serial.println(flightLogger.clearSavedLog() ? "[LOG] CLEAR=OK" : "[LOG] CLEAR=FAILED");
+    return;
+  }
+  Serial.println("[LOG] UNKNOWN_ACTION");
+}
+
 void processCommandLine(char *commandLine)
 {
   if (commandLine[0] == '\0')
@@ -320,6 +380,13 @@ void processCommandLine(char *commandLine)
   {
     stopMotorOutput();
     Serial.println("[DIAG] MOTOR_OUTPUT=STOPPED");
+    return;
+  }
+
+  char logAction[16] = {};
+  if (sscanf(commandLine, "log %15s", logAction) == 1)
+  {
+    processLogCommand(logAction);
     return;
   }
 
@@ -360,11 +427,7 @@ void processSerialInput()
 void processOfflineArmControl(uint32_t nowMs)
 {
   const balance_car::app::OfflineArmEvent event = offlineArmControl.update(nowMs, safetyManager.state());
-  if (event == balance_car::app::OfflineArmEvent::StartBalance)
-  {
-    requestBalance();
-  }
-  else if (event == balance_car::app::OfflineArmEvent::StopBalance)
+  if (event == balance_car::app::OfflineArmEvent::StopBalance)
   {
     stopMotorOutput();
     Serial.println("[OFFLINE] MOTOR_OUTPUT=STOPPED");
@@ -404,10 +467,27 @@ void updateBalanceControl(uint32_t nowMs)
   lastControlUpdateMs = nowMs;
   latestImuSample = imuDriver.read();
   latestAttitude = attitudeEstimator.update(latestImuSample);
+  if (autoBalanceStartPending)
+  {
+    // Start once after reset, only after a valid attitude sample is available.
+    // A rejected request (for example, the car is already lying down) requires
+    // another reset after placing the car upright.
+    autoBalanceStartPending = false;
+    requestBalance();
+  }
+  const bool wasBalancing = safetyManager.isBalancing();
   safetyManager.monitorBalance(latestAttitude.pitchDegrees, latestAttitude.valid, imuDriver.isHealthy());
 
   if (!safetyManager.isBalancing())
   {
+    if (wasBalancing)
+    {
+      appendFlightLogSample();
+      if (!flightLogger.saveSession())
+      {
+        Serial.println("[LOG] SAVE=FAILED");
+      }
+    }
     latestBalanceMotorCommand = 0.0F;
     latestMixedMotorCommand = {};
     return;
@@ -417,6 +497,7 @@ void updateBalanceControl(uint32_t nowMs)
   latestMixedMotorCommand = balance_car::control::MotorMixer::mix(
       latestBalanceMotorCommand, motionCommand.turnCommand());
   motorDriver.setNormalized(latestMixedMotorCommand.left, latestMixedMotorCommand.right);
+  appendFlightLogSample();
 }
 
 void printTelemetry(uint32_t nowMs)
@@ -474,10 +555,12 @@ void setup()
   Serial.println();
   Serial.println("===== Balance Car Cascaded Control =====");
   offlineArmControl.begin();
+  Serial.println(flightLogger.begin() ? "[LOG] STORAGE=READY" : "[LOG] STORAGE=UNAVAILABLE");
   safetyManager.begin();
   const balance_car::app::SelfTestReport report = selfTest.run();
   balance_car::app::SelfTest::printReport(Serial, report);
   safetyManager.completeSelfTest(report);
+  autoBalanceStartPending = report.passed;
   printStatus();
   printHelp();
 }

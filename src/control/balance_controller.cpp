@@ -13,18 +13,20 @@ BalanceController::BalanceController(const config::BalanceConfiguration &configu
 void BalanceController::reset()
 {
   _integralDegrees = 0.0F;
+  _state = {};
 }
 
 float BalanceController::update(const AttitudeState &attitude, float velocityPitchOffsetDegrees)
 {
   if (!attitude.valid)
   {
+    _state = {};
     return 0.0F;
   }
 
-  const float requestedPitchDegrees = _tuning.targetPitchDegrees + velocityPitchOffsetDegrees;
-  const float pitchErrorDegrees = attitude.pitchDegrees - requestedPitchDegrees;
-  _integralDegrees += pitchErrorDegrees;
+  _state.requestedPitchDegrees = _tuning.targetPitchDegrees + velocityPitchOffsetDegrees;
+  _state.pitchErrorDegrees = attitude.pitchDegrees - _state.requestedPitchDegrees;
+  _integralDegrees += _state.pitchErrorDegrees;
   if (_integralDegrees > _configuration.integralLimit)
   {
     _integralDegrees = _configuration.integralLimit;
@@ -34,23 +36,30 @@ float BalanceController::update(const AttitudeState &attitude, float velocityPit
     _integralDegrees = -_configuration.integralLimit;
   }
 
-  float motorCommand = _tuning.proportionalGain * pitchErrorDegrees +
-                       _tuning.integralGain * _integralDegrees +
-                       _tuning.derivativeGain * attitude.pitchRateDps;
+  _state.proportionalTerm = _tuning.proportionalGain * _state.pitchErrorDegrees;
+  _state.integralTerm = _tuning.integralGain * _integralDegrees;
+  _state.derivativeTerm = _tuning.derivativeGain * attitude.pitchRateDps;
+  _state.unclampedMotorCommand = _state.proportionalTerm + _state.integralTerm + _state.derivativeTerm;
   if (_configuration.motorOutputInverted)
   {
-    motorCommand = -motorCommand;
+    _state.unclampedMotorCommand = -_state.unclampedMotorCommand;
   }
 
-  if (motorCommand > _tuning.maximumMotorCommand)
+  _state.outputSaturated = false;
+  if (_state.unclampedMotorCommand > _tuning.maximumMotorCommand)
   {
-    return _tuning.maximumMotorCommand;
+    _state.motorCommand = _tuning.maximumMotorCommand;
+    _state.outputSaturated = true;
+    return _state.motorCommand;
   }
-  if (motorCommand < -_tuning.maximumMotorCommand)
+  if (_state.unclampedMotorCommand < -_tuning.maximumMotorCommand)
   {
-    return -_tuning.maximumMotorCommand;
+    _state.motorCommand = -_tuning.maximumMotorCommand;
+    _state.outputSaturated = true;
+    return _state.motorCommand;
   }
-  return motorCommand;
+  _state.motorCommand = _state.unclampedMotorCommand;
+  return _state.motorCommand;
 }
 
 void BalanceController::setProportionalGain(float gain)
@@ -76,5 +85,10 @@ void BalanceController::setTargetPitchDegrees(float targetPitchDegrees)
 BalanceTuning BalanceController::tuning() const
 {
   return _tuning;
+}
+
+const BalanceState &BalanceController::state() const
+{
+  return _state;
 }
 } // namespace balance_car::control
