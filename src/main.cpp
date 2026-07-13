@@ -703,7 +703,15 @@ namespace
     Serial.print(latestMixedMotorCommand.left, 3);
     Serial.print(',');
     Serial.print(latestMixedMotorCommand.right, 3);
-    Serial.print(" ticks=");
+    Serial.print(" wheel_mps_lr=");
+    Serial.print(latestWheelSpeed.leftMetersPerSecond, 3);
+    Serial.print(',');
+    Serial.print(latestWheelSpeed.rightMetersPerSecond, 3);
+    Serial.print(" tick_delta_lr=");
+    Serial.print(latestWheelSpeed.leftTickDelta);
+    Serial.print(',');
+    Serial.print(latestWheelSpeed.rightTickDelta);
+    Serial.print(" ticks_lr=");
     Serial.print(latestWheelSpeed.leftTicks);
     Serial.print(',');
     Serial.println(latestWheelSpeed.rightTicks);

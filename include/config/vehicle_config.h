@@ -93,14 +93,16 @@ namespace balance_car::config
       .rightDirectionInverted = false,
   };
 
-  constexpr EncoderConfiguration kEncoderConfiguration = {
+constexpr EncoderConfiguration kEncoderConfiguration = {
       // Measured with the current A-phase CHANGE interrupt counting method.
       .countsPerWheelRevolution = 530.0F,
       .wheelDiameterMeters = 0.064F,
-      .useInternalPullups = true,
-      .leftDirectionInverted = false,
-      .rightDirectionInverted = false,
-  };
+    .useInternalPullups = true,
+    .leftDirectionInverted = false,
+    // The right encoder is mirror-mounted.  Invert it so both wheels report
+    // the same sign when the vehicle moves forward.
+    .rightDirectionInverted = true,
+};
 
   constexpr ImuConfiguration kImuConfiguration = {
       .i2cFrequencyHz = 400000,
