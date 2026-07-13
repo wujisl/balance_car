@@ -1,0 +1,9 @@
+# ESP32-S3 平衡小车上位机依赖
+# 安装方式：
+#   d:\workspace\balance_camera\venv_host\Scripts\python.exe -m pip install -r tools/requirements.txt
+
+PyQt5>=5.15.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+requests>=2.31.0
+pyserial>=3.5

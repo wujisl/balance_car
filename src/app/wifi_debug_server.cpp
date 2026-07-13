@@ -70,6 +70,9 @@ void WifiDebugServer::begin()
            _configuration.telemetryPort, _configuration.commandPort);
   writeConsoleBytes(reinterpret_cast<const uint8_t *>(startupLine), strlen(startupLine));
   writeConsoleByte('\n');
+  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,1 fields=31 logs=L,seq,text subscription=H"),
+                    strlen("[WIFI] DEBUG telemetry=T,1 fields=31 logs=L,seq,text subscription=H"));
+  writeConsoleByte('\n');
 }
 
 void WifiDebugServer::service()
@@ -165,7 +168,17 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,1,%lu,%lu,%u,%u,%u,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.5f,%.5f,%.5f,%.3f,%.5f,%.5f,%.3f,%.3f\n",
+      "T,1,%lu,%lu,%u,%u,%u,"
+      "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
+      "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
+      "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
+      "%.3f,%.3f,%.3f,"       // target, filtered, error speed
+      "%.3f,%.3f,"             // speed pitch offset, turn
+      "%.3f,%.3f,"             // left/right motor command
+      "%.5f,%.5f,%.5f,"       // balance Kp/Ki/Kd
+      "%.3f,"                   // balance trim
+      "%.5f,%.5f,"             // speed Kp/Ki
+      "%.3f,%.3f\n",           // maximum motor, maximum pitch offset
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -194,24 +207,40 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   {
     ++_telemetryPacketsSinceDiagnostics;
   }
+  else
+  {
+    ++_telemetryFailuresSinceDiagnostics;
+  }
   if (nowMs - _lastTelemetryDiagnosticsMs >= 1000)
   {
     _lastTelemetryDiagnosticsMs = nowMs;
-    Serial.print("[WIFI] TELEMETRY_TX=");
+    Serial.print("[WIFI] TELEMETRY_TX_OK=");
     Serial.print(_telemetryPacketsSinceDiagnostics);
+    Serial.print(" FAIL=");
+    Serial.print(_telemetryFailuresSinceDiagnostics);
+    Serial.print(" SEQ=");
+    Serial.print(_telemetrySequence - 1);
+    Serial.print(" BYTES=");
+    Serial.print(length);
     Serial.print(" TARGET=");
     Serial.print(targetIp);
     Serial.print(':');
     Serial.print(targetPort);
     Serial.print(" LAST_SEND=");
-    Serial.println(sent ? "OK" : "FAILED");
+    Serial.print(sent ? "OK" : "FAILED");
+    Serial.print(" SUBSCRIBED=");
+    Serial.print(_telemetryPort != 0 ? 1 : 0);
+    Serial.print(" STATIONS=");
+    Serial.println(WiFi.softAPgetStationNum());
     char logLine[kConsoleLineCapacity] = {};
-    snprintf(logLine, sizeof(logLine), "[WIFI] TELEMETRY_TX=%u TARGET=%u.%u.%u.%u:%u LAST_SEND=%s",
-             _telemetryPacketsSinceDiagnostics,
+    snprintf(logLine, sizeof(logLine), "[WIFI] TX ok=%u fail=%u seq=%lu bytes=%d target=%u.%u.%u.%u:%u send=%s sub=%u sta=%u",
+             _telemetryPacketsSinceDiagnostics, _telemetryFailuresSinceDiagnostics,
+             static_cast<unsigned long>(_telemetrySequence - 1), length,
              targetIp[0], targetIp[1], targetIp[2], targetIp[3], targetPort,
-             sent ? "OK" : "FAILED");
+             sent ? "OK" : "FAILED", _telemetryPort != 0 ? 1U : 0U, WiFi.softAPgetStationNum());
     sendConsoleLine(logLine);
     _telemetryPacketsSinceDiagnostics = 0;
+    _telemetryFailuresSinceDiagnostics = 0;
   }
 }
 
@@ -221,6 +250,13 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
   while (length > 0 && isspace(static_cast<unsigned char>(packet[length - 1])))
   {
     packet[--length] = '\0';
+  }
+  // Accept legacy host packets that accidentally ended with the two literal
+  // characters "\\n" instead of a newline.
+  if (length >= 2 && packet[length - 2] == '\\' && packet[length - 1] == 'n')
+  {
+    length -= 2;
+    packet[length] = '\0';
   }
   char *context = nullptr;
   char *prefix = strtok_r(packet, ",", &context);
@@ -235,6 +271,7 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
     const bool changed = _telemetryPort != _replyPort || _telemetryIp != _replyIp;
     _telemetryIp = _replyIp;
     _telemetryPort = _replyPort;
+    ++_subscriptionCount;
     if (changed)
     {
       Serial.print("[WIFI] TELEMETRY_SUBSCRIBER=");
@@ -245,8 +282,19 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       snprintf(logLine, sizeof(logLine), "[WIFI] TELEMETRY_SUBSCRIBER=%u.%u.%u.%u:%u",
                _telemetryIp[0], _telemetryIp[1], _telemetryIp[2], _telemetryIp[3], _telemetryPort);
       sendConsoleLine(logLine);
+      sendConsoleHistory();
     }
-    sendConsoleHistory();
+    const uint32_t nowMs = millis();
+    if (changed || nowMs - _lastSubscriptionDiagnosticsMs >= 2000)
+    {
+      _lastSubscriptionDiagnosticsMs = nowMs;
+      char logLine[kConsoleLineCapacity] = {};
+      snprintf(logLine, sizeof(logLine), "[WIFI] H rx=%lu from=%u.%u.%u.%u:%u changed=%u stations=%u",
+               static_cast<unsigned long>(_subscriptionCount), _replyIp[0], _replyIp[1], _replyIp[2], _replyIp[3],
+               _replyPort, changed ? 1U : 0U, WiFi.softAPgetStationNum());
+      Serial.println(logLine);
+      sendConsoleLine(logLine);
+    }
     return false;
   }
 

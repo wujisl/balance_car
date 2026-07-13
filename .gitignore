@@ -5,6 +5,8 @@
 # NOTE: .vscode/ is intentionally ignored to avoid syncing personal IDE settings.
 !/doc/
 !/doc/**
+!/tool/
+!/tool/**
 !/include/
 !/include/**
 !/lib/

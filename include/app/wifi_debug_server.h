@@ -91,7 +91,10 @@ private:
   uint32_t _consoleSequence = 0;
   uint32_t _lastTelemetryMs = 0;
   uint32_t _lastTelemetryDiagnosticsMs = 0;
+  uint32_t _lastSubscriptionDiagnosticsMs = 0;
+  uint32_t _subscriptionCount = 0;
   uint16_t _telemetryPacketsSinceDiagnostics = 0;
+  uint16_t _telemetryFailuresSinceDiagnostics = 0;
   char _consoleLine[kConsoleLineCapacity] = {};
   char _consoleHistory[kConsoleHistoryDepth][kConsoleLineCapacity] = {};
   size_t _consoleLineLength = 0;
