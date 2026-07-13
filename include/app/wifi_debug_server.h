@@ -14,6 +14,7 @@ enum class WifiCommandKind : uint8_t
   Arm,
   Stop,
   Drive,
+  Turn,
 };
 
 struct WifiTuningCommand
@@ -47,12 +48,21 @@ struct WifiTelemetry
   float turnCommand = 0.0F;
   float leftMotorCommand = 0.0F;
   float rightMotorCommand = 0.0F;
+  float leftWheelSpeedMps = 0.0F;
+  float rightWheelSpeedMps = 0.0F;
+  float requestedPitchDegrees = 0.0F;
+  float balancePitchErrorDegrees = 0.0F;
+  float balanceProportionalTerm = 0.0F;
+  float balanceIntegralTerm = 0.0F;
+  float balanceDerivativeTerm = 0.0F;
+  float balanceMotorRaw = 0.0F;
   float balanceKp = 0.0F;
   float balanceKi = 0.0F;
   float balanceKd = 0.0F;
   float balanceTrimDegrees = 0.0F;
   float speedKp = 0.0F;
   float speedKi = 0.0F;
+  bool speedInverted = false;
   float maximumMotorCommand = 0.0F;
   float maximumPitchOffsetDegrees = 0.0F;
 };

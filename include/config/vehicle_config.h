@@ -131,7 +131,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
   constexpr BalanceConfiguration kBalanceConfiguration = {
       .controlPeriodMs = 5,
       // Initial mechanical-balance trim measured on the assembled vehicle.
-      .targetPitchDegrees = -2.24F,
+      .targetPitchDegrees = -2.09F,
       .proportionalGain = 0.15F,
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
@@ -144,9 +144,10 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
 
   constexpr VelocityConfiguration kVelocityConfiguration = {
       .controlPeriodMs = 40,
-      // Conservative outer PI starting point. Verify forward direction at low speed.
-      .proportionalGain = 3.0F,
-      .integralGain = 0.15F,
+      // P-only midpoint between the insufficient 0.2 test and the strongly
+      // oscillatory 3.0 test.  Refine from this point with small increments.
+      .proportionalGain = 6.0F,
+      .integralGain = 0.0F,
       .integralLimit = 2.0F,
       .maximumPitchOffsetDegrees = 6.0F,
       .measurementFilterAlpha = 0.3F,
@@ -155,7 +156,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
 
   constexpr MotionConfiguration kMotionConfiguration = {
       .maximumTargetSpeedMps = 0.25F,
-      .initialTargetSpeedMps = 0.05F,
+      .initialTargetSpeedMps = 0.03F,
       .targetSpeedStepMps = 0.05F,
       .maximumTurnCommand = 0.20F,
       .turnCommandStep = 0.03F,

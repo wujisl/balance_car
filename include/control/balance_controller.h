@@ -14,6 +14,17 @@ struct BalanceTuning
   float maximumMotorCommand;
 };
 
+// Latest inner-loop quantities, captured during update() for telemetry only.
+struct BalanceState
+{
+  float requestedPitchDegrees = 0.0F;
+  float pitchErrorDegrees = 0.0F;
+  float proportionalTerm = 0.0F;
+  float integralTerm = 0.0F;
+  float derivativeTerm = 0.0F;
+  float motorCommandRaw = 0.0F;
+};
+
 class BalanceController
 {
 public:
@@ -27,10 +38,12 @@ public:
   void setTargetPitchDegrees(float targetPitchDegrees);
   void setMaximumMotorCommand(float maximumMotorCommand);
   BalanceTuning tuning() const;
+  const BalanceState &state() const;
 
 private:
   const config::BalanceConfiguration &_configuration;
   BalanceTuning _tuning;
+  BalanceState _state;
   float _integralDegrees = 0.0F;
 };
 } // namespace balance_car::control

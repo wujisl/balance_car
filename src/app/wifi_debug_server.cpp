@@ -168,7 +168,7 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,1,%lu,%lu,%u,%u,%u,"
+      "T,3,%lu,%lu,%u,%u,%u,"
       "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
       "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
       "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
@@ -178,7 +178,11 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       "%.5f,%.5f,%.5f,"       // balance Kp/Ki/Kd
       "%.3f,"                   // balance trim
       "%.5f,%.5f,"             // speed Kp/Ki
-      "%.3f,%.3f\n",           // maximum motor, maximum pitch offset
+      "%.3f,%.3f,"              // maximum motor, maximum pitch offset
+      "%.3f,%.3f,"              // left/right wheel speed
+      "%.3f,%.3f,"              // requested pitch, balance pitch error
+      "%.5f,%.5f,%.5f,"         // balance P/I/D terms
+      "%.5f,%u\n",             // raw balance motor command, speed output inverted
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -192,7 +196,11 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.leftMotorCommand, telemetry.rightMotorCommand,
       telemetry.balanceKp, telemetry.balanceKi, telemetry.balanceKd,
       telemetry.balanceTrimDegrees, telemetry.speedKp, telemetry.speedKi,
-      telemetry.maximumMotorCommand, telemetry.maximumPitchOffsetDegrees);
+      telemetry.maximumMotorCommand, telemetry.maximumPitchOffsetDegrees,
+      telemetry.leftWheelSpeedMps, telemetry.rightWheelSpeedMps,
+      telemetry.requestedPitchDegrees, telemetry.balancePitchErrorDegrees,
+      telemetry.balanceProportionalTerm, telemetry.balanceIntegralTerm, telemetry.balanceDerivativeTerm,
+      telemetry.balanceMotorRaw, telemetry.speedInverted ? 1U : 0U);
   if (length <= 0 || length >= static_cast<int>(sizeof(packet)))
   {
     return;
@@ -364,6 +372,24 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       }
       _pendingCommand.kind = WifiCommandKind::Drive;
       _pendingCommand.value = speedMps;
+    }
+    else if (strcmp(action, "turn") == 0)
+    {
+      char *turnText = strtok_r(nullptr, ",", &context);
+      if (turnText == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      char *turnEnd = nullptr;
+      const float turn = strtof(turnText, &turnEnd);
+      if (*turnText == '\0' || *turnEnd != '\0' || !isfinite(turn) || fabsf(turn) > 0.20F)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "TURN_RANGE");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::Turn;
+      _pendingCommand.value = turn;
     }
     else
     {

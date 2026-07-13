@@ -567,6 +567,18 @@ namespace
                                           accepted ? "DRIVE_ACCEPTED" :
                                                      (safetyManager.isBalancing() ? "SPEED_RANGE" : "NOT_BALANCING"));
       }
+      else if (command.kind == balance_car::app::WifiCommandKind::Turn)
+      {
+        if (safetyManager.isBalancing())
+        {
+          motionCommand.setTurnCommand(command.value);
+          wifiDebugServer.sendCommandResult(command.requestSequence, true, "TURN_ACCEPTED");
+        }
+        else
+        {
+          wifiDebugServer.sendCommandResult(command.requestSequence, false, "NOT_BALANCING");
+        }
+      }
       else
       {
         const bool accepted = applyWifiTuningCommand(command);
@@ -580,6 +592,7 @@ namespace
   {
     const balance_car::control::VelocityState velocityState = velocityController.state();
     const balance_car::control::BalanceTuning balanceTuning = balanceController.tuning();
+    const balance_car::control::BalanceState balanceState = balanceController.state();
     const balance_car::control::VelocityTuning velocityTuning = velocityController.tuning();
     balance_car::app::WifiTelemetry telemetry = {};
     telemetry.timestampMs = nowMs;
@@ -602,12 +615,21 @@ namespace
     telemetry.turnCommand = motionCommand.turnCommand();
     telemetry.leftMotorCommand = latestMixedMotorCommand.left;
     telemetry.rightMotorCommand = latestMixedMotorCommand.right;
+    telemetry.leftWheelSpeedMps = latestWheelSpeed.leftMetersPerSecond;
+    telemetry.rightWheelSpeedMps = latestWheelSpeed.rightMetersPerSecond;
+    telemetry.requestedPitchDegrees = balanceState.requestedPitchDegrees;
+    telemetry.balancePitchErrorDegrees = balanceState.pitchErrorDegrees;
+    telemetry.balanceProportionalTerm = balanceState.proportionalTerm;
+    telemetry.balanceIntegralTerm = balanceState.integralTerm;
+    telemetry.balanceDerivativeTerm = balanceState.derivativeTerm;
+    telemetry.balanceMotorRaw = balanceState.motorCommandRaw;
     telemetry.balanceKp = balanceTuning.proportionalGain;
     telemetry.balanceKi = balanceTuning.integralGain;
     telemetry.balanceKd = balanceTuning.derivativeGain;
     telemetry.balanceTrimDegrees = balanceTuning.targetPitchDegrees;
     telemetry.speedKp = velocityTuning.proportionalGain;
     telemetry.speedKi = velocityTuning.integralGain;
+    telemetry.speedInverted = velocityTuning.outputInverted;
     telemetry.maximumMotorCommand = balanceTuning.maximumMotorCommand;
     telemetry.maximumPitchOffsetDegrees = velocityTuning.maximumPitchOffsetDegrees;
     wifiDebugServer.publish(telemetry, nowMs);

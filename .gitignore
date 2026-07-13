@@ -7,6 +7,8 @@
 !/doc/**
 !/tool/
 !/tool/**
+# Runtime speed telemetry recordings produced by the host application.
+/tool/records/
 !/include/
 !/include/**
 !/lib/
