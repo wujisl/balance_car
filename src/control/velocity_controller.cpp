@@ -2,6 +2,11 @@
 
 namespace balance_car::control
 {
+namespace
+{
+constexpr float kAbsoluteMaximumPitchOffsetDegrees = 15.0F;
+}
+
 VelocityController::VelocityController(const config::VelocityConfiguration &configuration)
     : _configuration(configuration),
       _tuning{configuration.proportionalGain, configuration.integralGain,
@@ -71,6 +76,22 @@ void VelocityController::setProportionalGain(float gain)
 void VelocityController::setIntegralGain(float gain)
 {
   _tuning.integralGain = gain < 0.0F ? 0.0F : gain;
+}
+
+void VelocityController::setMaximumPitchOffsetDegrees(float maximumPitchOffsetDegrees)
+{
+  if (maximumPitchOffsetDegrees < 0.0F)
+  {
+    _tuning.maximumPitchOffsetDegrees = 0.0F;
+  }
+  else if (maximumPitchOffsetDegrees > kAbsoluteMaximumPitchOffsetDegrees)
+  {
+    _tuning.maximumPitchOffsetDegrees = kAbsoluteMaximumPitchOffsetDegrees;
+  }
+  else
+  {
+    _tuning.maximumPitchOffsetDegrees = maximumPitchOffsetDegrees;
+  }
 }
 
 void VelocityController::setOutputInverted(bool inverted)

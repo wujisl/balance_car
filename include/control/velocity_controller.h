@@ -29,6 +29,7 @@ public:
   float update(float targetSpeedMps, float measuredSpeedMps, float deltaSeconds);
   void setProportionalGain(float gain);
   void setIntegralGain(float gain);
+  void setMaximumPitchOffsetDegrees(float maximumPitchOffsetDegrees);
   void setOutputInverted(bool inverted);
   VelocityTuning tuning() const;
   const VelocityState &state() const;

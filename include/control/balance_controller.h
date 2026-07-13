@@ -25,6 +25,7 @@ public:
   void setIntegralGain(float gain);
   void setDerivativeGain(float gain);
   void setTargetPitchDegrees(float targetPitchDegrees);
+  void setMaximumMotorCommand(float maximumMotorCommand);
   BalanceTuning tuning() const;
 
 private:

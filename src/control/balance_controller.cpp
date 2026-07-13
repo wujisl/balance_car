@@ -2,6 +2,11 @@
 
 namespace balance_car::control
 {
+namespace
+{
+constexpr float kAbsoluteMaximumMotorCommand = 1.0F;
+}
+
 BalanceController::BalanceController(const config::BalanceConfiguration &configuration)
     : _configuration(configuration),
       _tuning{configuration.targetPitchDegrees, configuration.proportionalGain,
@@ -71,6 +76,22 @@ void BalanceController::setDerivativeGain(float gain)
 void BalanceController::setTargetPitchDegrees(float targetPitchDegrees)
 {
   _tuning.targetPitchDegrees = targetPitchDegrees;
+}
+
+void BalanceController::setMaximumMotorCommand(float maximumMotorCommand)
+{
+  if (maximumMotorCommand < 0.0F)
+  {
+    _tuning.maximumMotorCommand = 0.0F;
+  }
+  else if (maximumMotorCommand > kAbsoluteMaximumMotorCommand)
+  {
+    _tuning.maximumMotorCommand = kAbsoluteMaximumMotorCommand;
+  }
+  else
+  {
+    _tuning.maximumMotorCommand = maximumMotorCommand;
+  }
 }
 
 BalanceTuning BalanceController::tuning() const

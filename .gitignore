@@ -3,6 +3,8 @@
 
 # Keep only project source directories and required configuration files.
 # NOTE: .vscode/ is intentionally ignored to avoid syncing personal IDE settings.
+!/doc/
+!/doc/**
 !/include/
 !/include/**
 !/lib/
