@@ -321,7 +321,7 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
   if (strcmp(prefix, "C") == 0)
   {
     char *action = strtok_r(nullptr, ",", &context);
-    if (action == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+    if (action == nullptr)
     {
       sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
       return false;
@@ -330,9 +330,41 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
     _pendingCommand = {};
     _pendingCommand.requestSequence = static_cast<uint32_t>(sequence);
     if (strcmp(action, "arm") == 0)
+    {
+      if (strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
       _pendingCommand.kind = WifiCommandKind::Arm;
+    }
     else if (strcmp(action, "stop") == 0)
+    {
+      if (strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
       _pendingCommand.kind = WifiCommandKind::Stop;
+    }
+    else if (strcmp(action, "drive") == 0)
+    {
+      char *speedText = strtok_r(nullptr, ",", &context);
+      if (speedText == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      char *speedEnd = nullptr;
+      const float speedMps = strtof(speedText, &speedEnd);
+      if (*speedText == '\0' || *speedEnd != '\0' || !isfinite(speedMps))
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_SPEED");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::Drive;
+      _pendingCommand.value = speedMps;
+    }
     else
     {
       sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_ACTION");

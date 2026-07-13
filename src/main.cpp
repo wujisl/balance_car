@@ -25,6 +25,7 @@ namespace
 {
   constexpr uint32_t kTelemetryPeriodMs = 500;
   constexpr size_t kSerialCommandCapacity = 96;
+  constexpr float kWifiDriveSpeedSlewRateMpsPerSecond = 0.10F;
 
   balance_car::hal::I2cBus i2cBus(Wire);
   balance_car::drivers::MotorDriver motorDriver(
@@ -95,6 +96,8 @@ namespace
   balance_car::control::MixedMotorCommand latestMixedMotorCommand = {};
   float latestBalanceMotorCommand = 0.0F;
   float latestVelocityPitchOffsetDegrees = 0.0F;
+  float wifiDriveRequestedSpeedMps = 0.0F;
+  bool wifiDriveSlewActive = false;
   uint32_t lastControlUpdateMs = 0;
   uint32_t lastVelocityUpdateMs = 0;
   uint32_t lastTelemetryMs = 0;
@@ -174,9 +177,13 @@ namespace
       balanceController.reset();
       velocityController.reset();
       motionCommand.clear();
+      motionCommand.setTargetSpeedMps(balance_car::config::kMotionConfiguration.initialTargetSpeedMps);
+      wifiDriveRequestedSpeedMps = 0.0F;
+      wifiDriveSlewActive = false;
       latestBalanceMotorCommand = 0.0F;
       latestVelocityPitchOffsetDegrees = 0.0F;
-      Serial.println("[BALANCE] STATE=ACTIVE");
+      Serial.print("[BALANCE] STATE=ACTIVE INITIAL_TARGET_SPEED_MPS=");
+      Serial.println(motionCommand.targetSpeedMps(), 3);
       return true;
     }
     Serial.println("[BALANCE] STATE=REJECTED");
@@ -189,9 +196,68 @@ namespace
     balanceController.reset();
     velocityController.reset();
     motionCommand.clear();
+    wifiDriveRequestedSpeedMps = 0.0F;
+    wifiDriveSlewActive = false;
     latestBalanceMotorCommand = 0.0F;
     latestVelocityPitchOffsetDegrees = 0.0F;
     latestMixedMotorCommand = {};
+  }
+
+  void cancelWifiDriveSlew()
+  {
+    wifiDriveRequestedSpeedMps = 0.0F;
+    wifiDriveSlewActive = false;
+  }
+
+  bool requestWifiDriveSpeed(float speedMps)
+  {
+    if (!safetyManager.isBalancing())
+    {
+      return false;
+    }
+    if (speedMps < 0.0F || speedMps > balance_car::config::kMotionConfiguration.maximumTargetSpeedMps)
+    {
+      return false;
+    }
+
+    wifiDriveRequestedSpeedMps = speedMps;
+    wifiDriveSlewActive = true;
+    Serial.print("[WIFI] DRIVE_REQUEST_MPS=");
+    Serial.println(speedMps, 3);
+    return true;
+  }
+
+  void updateWifiDriveTarget(float deltaSeconds)
+  {
+    if (!wifiDriveSlewActive || deltaSeconds <= 0.0F)
+    {
+      return;
+    }
+
+    const float currentSpeedMps = motionCommand.targetSpeedMps();
+    const float maximumDeltaMps = kWifiDriveSpeedSlewRateMpsPerSecond * deltaSeconds;
+    float nextSpeedMps = currentSpeedMps;
+    if (currentSpeedMps < wifiDriveRequestedSpeedMps)
+    {
+      nextSpeedMps += maximumDeltaMps;
+      if (nextSpeedMps > wifiDriveRequestedSpeedMps)
+      {
+        nextSpeedMps = wifiDriveRequestedSpeedMps;
+      }
+    }
+    else if (currentSpeedMps > wifiDriveRequestedSpeedMps)
+    {
+      nextSpeedMps -= maximumDeltaMps;
+      if (nextSpeedMps < wifiDriveRequestedSpeedMps)
+      {
+        nextSpeedMps = wifiDriveRequestedSpeedMps;
+      }
+    }
+    motionCommand.setTargetSpeedMps(nextSpeedMps);
+    if (wifiDriveRequestedSpeedMps == 0.0F && nextSpeedMps == 0.0F)
+    {
+      wifiDriveSlewActive = false;
+    }
   }
 
   void reportSafetyFaultTransition()
@@ -245,6 +311,7 @@ namespace
       }
       else if (strcmp(parameter, "target") == 0)
       {
+        cancelWifiDriveSlew();
         motionCommand.setTargetSpeedMps(value);
       }
       else if (strcmp(parameter, "invert") == 0)
@@ -261,6 +328,7 @@ namespace
     {
       if (strcmp(parameter, "speed") == 0)
       {
+        cancelWifiDriveSlew();
         motionCommand.setTargetSpeedMps(value);
       }
       else if (strcmp(parameter, "turn") == 0)
@@ -322,14 +390,17 @@ namespace
                        -balance_car::config::kSafetyConfiguration.manualTestPower);
       break;
     case 'w':
+      cancelWifiDriveSlew();
       motionCommand.adjustTargetSpeedMps(balance_car::config::kMotionConfiguration.targetSpeedStepMps);
       printMotionCommand();
       break;
     case 'z':
+      cancelWifiDriveSlew();
       motionCommand.adjustTargetSpeedMps(-balance_car::config::kMotionConfiguration.targetSpeedStepMps);
       printMotionCommand();
       break;
     case 'c':
+      cancelWifiDriveSlew();
       motionCommand.setTargetSpeedMps(0.0F);
       printMotionCommand();
       break;
@@ -489,6 +560,13 @@ namespace
         Serial.println("[WIFI] MOTOR_OUTPUT=STOPPED");
         wifiDebugServer.sendCommandResult(command.requestSequence, true, "STOPPED");
       }
+      else if (command.kind == balance_car::app::WifiCommandKind::Drive)
+      {
+        const bool accepted = requestWifiDriveSpeed(command.value);
+        wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
+                                          accepted ? "DRIVE_ACCEPTED" :
+                                                     (safetyManager.isBalancing() ? "SPEED_RANGE" : "NOT_BALANCING"));
+      }
       else
       {
         const bool accepted = applyWifiTuningCommand(command);
@@ -554,6 +632,7 @@ namespace
 
     const float measuredSpeedMps = 0.5F *
                                    (latestWheelSpeed.leftMetersPerSecond + latestWheelSpeed.rightMetersPerSecond);
+    updateWifiDriveTarget(static_cast<float>(elapsedMs) / 1000.0F);
     latestVelocityPitchOffsetDegrees = velocityController.update(
         motionCommand.targetSpeedMps(), measuredSpeedMps, static_cast<float>(elapsedMs) / 1000.0F);
   }
