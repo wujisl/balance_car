@@ -93,7 +93,8 @@ constexpr MotorConfiguration kMotorConfiguration = {
 };
 
 constexpr EncoderConfiguration kEncoderConfiguration = {
-    .countsPerWheelRevolution = 780.0F,
+    // Measured with the current A-phase CHANGE interrupt counting method.
+    .countsPerWheelRevolution = 530.0F,
     .wheelDiameterMeters = 0.064F,
     .useInternalPullups = true,
     .leftDirectionInverted = false,
