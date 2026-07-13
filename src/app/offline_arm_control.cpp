@@ -39,6 +39,18 @@ OfflineArmEvent OfflineArmControl::update(uint32_t nowMs, SafetyState safetyStat
     _buttonPressedAtMs = 0;
     _startRequested = false;
     _buttonWasPressed = buttonPressed;
+    _wasInStandby = false;
+    return OfflineArmEvent::None;
+  }
+
+  // A BOOT press that began while the system was still starting is ignored;
+  // require a fresh long press after the relaxed startup check completes.
+  if (!_wasInStandby)
+  {
+    _wasInStandby = true;
+    _buttonPressedAtMs = 0;
+    _startRequested = false;
+    _buttonWasPressed = buttonPressed;
     return OfflineArmEvent::None;
   }
 

@@ -30,5 +30,6 @@ private:
   bool _buttonWasPressed = false;
   bool _awaitingInitialRelease = false;
   bool _startRequested = false;
+  bool _wasInStandby = false;
 };
 } // namespace balance_car::app

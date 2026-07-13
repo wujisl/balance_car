@@ -98,6 +98,7 @@ namespace
   uint32_t lastControlUpdateMs = 0;
   uint32_t lastVelocityUpdateMs = 0;
   uint32_t lastTelemetryMs = 0;
+  balance_car::app::SafetyState lastReportedSafetyState = balance_car::app::SafetyState::Boot;
   char serialCommandBuffer[kSerialCommandCapacity] = {};
   size_t serialCommandLength = 0;
 
@@ -191,6 +192,19 @@ namespace
     latestBalanceMotorCommand = 0.0F;
     latestVelocityPitchOffsetDegrees = 0.0F;
     latestMixedMotorCommand = {};
+  }
+
+  void reportSafetyFaultTransition()
+  {
+    const balance_car::app::SafetyState currentState = safetyManager.state();
+    if (currentState == balance_car::app::SafetyState::Fault &&
+        lastReportedSafetyState != balance_car::app::SafetyState::Fault)
+    {
+      Serial.print("[SAFETY] FALL_OR_RUNTIME_FAULT: ");
+      Serial.print(balance_car::app::SafetyManager::faultName(safetyManager.faultCode()));
+      Serial.println("; motors disabled, Wi-Fi telemetry and logs continue.");
+    }
+    lastReportedSafetyState = currentState;
   }
 
   void applyTuningCommand(const char *domain, const char *parameter, float value)
@@ -642,6 +656,7 @@ void loop()
   processOfflineArmControl(nowMs);
   updateVelocityControl(nowMs);
   updateBalanceControl(nowMs);
+  reportSafetyFaultTransition();
   printTelemetry(nowMs);
   publishWifiTelemetry(nowMs);
   delay(1);

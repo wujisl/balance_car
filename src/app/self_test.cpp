@@ -17,12 +17,17 @@ SelfTestReport SelfTest::run()
   report.imuReady = _imuDriver.begin();
   if (report.imuReady)
   {
-    report.imuCalibrated = _imuDriver.calibrateGyroscope();
+    // Do not require a stationary, multi-second gyro calibration at power-on.
+    // A valid first sample is enough to enter STANDBY; arming still checks
+    // current IMU health and the runtime monitor remains active.
+    report.imuSampleValid = _imuDriver.read().valid;
     report.imuModel = _imuDriver.model();
     report.imuAddress = _imuDriver.address();
   }
 
-  report.passed = report.motorDriverReady && report.encodersReady && report.imuReady && report.imuCalibrated;
+  // Motor/encoder begin results remain visible for diagnosis, but do not lock
+  // out balancing.  The minimum safe startup condition is a readable IMU.
+  report.passed = report.imuReady && report.imuSampleValid;
   return report;
 }
 
@@ -52,8 +57,9 @@ void SelfTest::printReport(Stream &output, const SelfTestReport &report)
     output.print("[SELFTEST] IMU_ADDRESS=0x");
     output.println(report.imuAddress, HEX);
   }
-  output.print("[SELFTEST] GYRO_CALIBRATION=");
-  output.println(report.imuCalibrated ? "PASS" : "FAIL");
+  output.println("[SELFTEST] GYRO_CALIBRATION=SKIPPED");
+  output.print("[SELFTEST] IMU_FIRST_SAMPLE=");
+  output.println(report.imuSampleValid ? "PASS" : "FAIL");
   output.print("[SELFTEST] RESULT=");
   output.println(report.passed ? "PASS" : "FAIL");
 }

@@ -19,7 +19,9 @@ void SafetyManager::begin()
 
 void SafetyManager::completeSelfTest(const SelfTestReport &report)
 {
-  _selfTestPassed = report.passed;
+  // Startup uses the relaxed criterion defined by SelfTest: IMU initialized
+  // and one readable sample.  Motor/encoder diagnostics stay informational.
+  _selfTestPassed = report.imuReady && report.imuSampleValid;
   if (!report.passed)
   {
     reportFault(FaultCode::SelfTestFailed);

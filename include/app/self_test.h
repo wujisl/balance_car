@@ -13,6 +13,7 @@ struct SelfTestReport
   bool motorDriverReady = false;
   bool encodersReady = false;
   bool imuReady = false;
+  bool imuSampleValid = false;
   bool imuCalibrated = false;
   bool passed = false;
   drivers::ImuModel imuModel = drivers::ImuModel::Unknown;
