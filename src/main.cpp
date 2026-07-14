@@ -301,7 +301,8 @@ namespace
     {
       return false;
     }
-    if (speedMps < 0.0F || speedMps > balance_car::config::kMotionConfiguration.maximumTargetSpeedMps)
+    if (speedMps < -balance_car::config::kMotionConfiguration.maximumTargetSpeedMps ||
+        speedMps > balance_car::config::kMotionConfiguration.maximumTargetSpeedMps)
     {
       return false;
     }

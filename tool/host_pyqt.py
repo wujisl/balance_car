@@ -1040,16 +1040,18 @@ class MainWindow(QMainWindow):
         self.btn_balance_reset.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_reset, 3, 0, 1, 2)
 
-        connection_grid.addWidget(QLabel("前进速度给定 (m/s):"), 3, 2)
+        connection_grid.addWidget(QLabel("前进 / 后退速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
-        self.spin_balance_drive_speed.setRange(0.0, 0.250)
+        self.spin_balance_drive_speed.setRange(-0.250, 0.250)
         self.spin_balance_drive_speed.setSingleStep(0.010)
         self.spin_balance_drive_speed.setValue(0.0)
         self.spin_balance_drive_speed.setEnabled(False)
-        self.spin_balance_drive_speed.setToolTip("仅在 BALANCING 状态下可下发；主板会按 0.10 m/s² 斜坡改变给定")
+        self.spin_balance_drive_speed.setToolTip(
+            "仅在 BALANCING 状态下可下发；正值前进、负值后退，主板会按 0.10 m/s² 斜坡改变给定"
+        )
         connection_grid.addWidget(self.spin_balance_drive_speed, 3, 3)
-        self.btn_balance_drive = QPushButton("设置前进速度")
+        self.btn_balance_drive = QPushButton("设置行驶速度")
         self.btn_balance_drive.clicked.connect(self.request_balance_drive_speed)
         self.btn_balance_drive.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_drive, 3, 4, 1, 2)
@@ -1078,27 +1080,54 @@ class MainWindow(QMainWindow):
         self.btn_balance_turn_zero.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_turn_zero, 4, 5, 1, 3)
 
-        connection_grid.addWidget(QLabel("自动路线:"), 5, 0)
+        connection_grid.addWidget(QLabel("方向快捷控制:"), 5, 0, 1, 2)
+        self.btn_balance_forward = QPushButton("↑ 前进")
+        self.btn_balance_forward.setToolTip("以速度输入框的绝对值前进，并清除转向差速度")
+        self.btn_balance_forward.clicked.connect(self.request_balance_forward)
+        self.btn_balance_forward.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_forward, 5, 2)
+        self.btn_balance_backward = QPushButton("↓ 后退")
+        self.btn_balance_backward.setToolTip("以速度输入框的绝对值后退，并清除转向差速度")
+        self.btn_balance_backward.clicked.connect(self.request_balance_backward)
+        self.btn_balance_backward.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_backward, 5, 3)
+        self.btn_balance_left = QPushButton("← 左转")
+        self.btn_balance_left.setToolTip("仅设定左转差速度，保持当前前进或后退速度")
+        self.btn_balance_left.clicked.connect(self.request_balance_left)
+        self.btn_balance_left.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_left, 5, 4)
+        self.btn_balance_right = QPushButton("→ 右转")
+        self.btn_balance_right.setToolTip("仅设定右转差速度，保持当前前进或后退速度")
+        self.btn_balance_right.clicked.connect(self.request_balance_right)
+        self.btn_balance_right.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_right, 5, 5)
+        self.btn_balance_motion_stop = QPushButton("停止行驶 / 转向")
+        self.btn_balance_motion_stop.setToolTip("平滑将行驶和转向目标清零；不停止平衡")
+        self.btn_balance_motion_stop.clicked.connect(self.request_balance_motion_stop)
+        self.btn_balance_motion_stop.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_motion_stop, 5, 6, 1, 2)
+
+        connection_grid.addWidget(QLabel("自动路线:"), 6, 0)
         self.cmb_route_direction = QComboBox()
         self.cmb_route_direction.addItems(["左转（两次半圆）", "右转（两次半圆）"])
-        connection_grid.addWidget(self.cmb_route_direction, 5, 1, 1, 2)
+        connection_grid.addWidget(self.cmb_route_direction, 6, 1, 1, 2)
         self.spin_route_turn = QDoubleSpinBox()
         self.spin_route_turn.setRange(0.01, 0.20)
         self.spin_route_turn.setDecimals(3)
         self.spin_route_turn.setSingleStep(0.01)
         self.spin_route_turn.setValue(0.060)
         self.spin_route_turn.setToolTip("目标右减左轮速差（m/s）；需通过实际转弯半径校准")
-        connection_grid.addWidget(self.spin_route_turn, 5, 3)
+        connection_grid.addWidget(self.spin_route_turn, 6, 3)
         self.btn_route_start = QPushButton("执行 2m-半圆-2m-半圆")
         self.btn_route_start.clicked.connect(self.start_route)
         self.btn_route_start.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_start, 5, 4, 1, 2)
+        connection_grid.addWidget(self.btn_route_start, 6, 4, 1, 2)
         self.btn_route_cancel = QPushButton("取消路线")
         self.btn_route_cancel.clicked.connect(self.cancel_route)
         self.btn_route_cancel.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_cancel, 5, 6)
+        connection_grid.addWidget(self.btn_route_cancel, 6, 6)
         self.lbl_route_status = QLabel("路线未运行")
-        connection_grid.addWidget(self.lbl_route_status, 6, 0, 1, 8)
+        connection_grid.addWidget(self.lbl_route_status, 7, 0, 1, 8)
         layout.addWidget(connection_group)
 
         live_group = QGroupBox("实时状态")
@@ -1263,6 +1292,11 @@ class MainWindow(QMainWindow):
         self.spin_balance_turn_speed.setEnabled(False)
         self.btn_balance_turn.setEnabled(False)
         self.btn_balance_turn_zero.setEnabled(False)
+        self.btn_balance_forward.setEnabled(False)
+        self.btn_balance_backward.setEnabled(False)
+        self.btn_balance_left.setEnabled(False)
+        self.btn_balance_right.setEnabled(False)
+        self.btn_balance_motion_stop.setEnabled(False)
         self.btn_route_start.setEnabled(False)
         self.btn_route_cancel.setEnabled(False)
         self.balance_ip_edit.setEnabled(False)
@@ -1299,6 +1333,11 @@ class MainWindow(QMainWindow):
             self.spin_balance_turn_speed.setEnabled(False)
             self.btn_balance_turn.setEnabled(False)
             self.btn_balance_turn_zero.setEnabled(False)
+            self.btn_balance_forward.setEnabled(False)
+            self.btn_balance_backward.setEnabled(False)
+            self.btn_balance_left.setEnabled(False)
+            self.btn_balance_right.setEnabled(False)
+            self.btn_balance_motion_stop.setEnabled(False)
             self.cancel_route(send_stop=False)
             self.btn_route_start.setEnabled(False)
             self.balance_ip_edit.setEnabled(True)
@@ -1543,6 +1582,63 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setValue(0.0)
         self._send_balance_control("DRIVE", 0.0)
 
+    def _cancel_route_for_manual_drive(self):
+        if self.route_active:
+            self.cancel_route()
+
+    def _drive_speed_magnitude(self):
+        speed = abs(self.spin_balance_drive_speed.value())
+        return speed if speed >= 0.001 else 0.060
+
+    def _turn_speed_magnitude(self):
+        speed = abs(self.spin_balance_turn_speed.value())
+        return speed if speed >= 0.001 else 0.060
+
+    def request_balance_forward(self):
+        if self.balance_worker is None:
+            return
+        self._cancel_route_for_manual_drive()
+        speed = self._drive_speed_magnitude()
+        self.spin_balance_drive_speed.setValue(speed)
+        self.spin_balance_turn_speed.setValue(0.0)
+        self._send_balance_control("TURN", 0.0)
+        self._send_balance_control("DRIVE", speed)
+
+    def request_balance_backward(self):
+        if self.balance_worker is None:
+            return
+        self._cancel_route_for_manual_drive()
+        speed = -self._drive_speed_magnitude()
+        self.spin_balance_drive_speed.setValue(speed)
+        self.spin_balance_turn_speed.setValue(0.0)
+        self._send_balance_control("TURN", 0.0)
+        self._send_balance_control("DRIVE", speed)
+
+    def request_balance_left(self):
+        if self.balance_worker is None:
+            return
+        self._cancel_route_for_manual_drive()
+        speed = self._turn_speed_magnitude()
+        self.spin_balance_turn_speed.setValue(speed)
+        self._send_balance_control("TURN", speed)
+
+    def request_balance_right(self):
+        if self.balance_worker is None:
+            return
+        self._cancel_route_for_manual_drive()
+        speed = -self._turn_speed_magnitude()
+        self.spin_balance_turn_speed.setValue(speed)
+        self._send_balance_control("TURN", speed)
+
+    def request_balance_motion_stop(self):
+        if self.balance_worker is None:
+            return
+        self._cancel_route_for_manual_drive()
+        self.spin_balance_drive_speed.setValue(0.0)
+        self.spin_balance_turn_speed.setValue(0.0)
+        self._send_balance_control("TURN", 0.0)
+        self._send_balance_control("DRIVE", 0.0)
+
     def request_balance_turn_speed(self):
         if self.balance_worker is None:
             self.log("请先连接主板 Wi-Fi 调试端口")
@@ -1663,6 +1759,11 @@ class MainWindow(QMainWindow):
         self.spin_balance_turn_speed.setEnabled(turn_enabled)
         self.btn_balance_turn.setEnabled(turn_enabled)
         self.btn_balance_turn_zero.setEnabled(turn_enabled)
+        self.btn_balance_forward.setEnabled(drive_enabled)
+        self.btn_balance_backward.setEnabled(drive_enabled)
+        self.btn_balance_left.setEnabled(turn_enabled)
+        self.btn_balance_right.setEnabled(turn_enabled)
+        self.btn_balance_motion_stop.setEnabled(drive_enabled)
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
         self._update_balance_packet_age(sequence)
