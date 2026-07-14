@@ -31,7 +31,7 @@ public:
 
   void reset();
   float update(float targetDifferentialSpeedMps, float leftSpeedMps, float rightSpeedMps,
-               float deltaSeconds);
+               float deltaSeconds, float maximumTurnMotorCommandOverride = -1.0F);
   void setProportionalGain(float gain);
   void setIntegralGain(float gain);
   void setMaximumTurnMotorCommand(float maximumTurnMotorCommand);

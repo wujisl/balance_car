@@ -16,6 +16,7 @@ enum class WifiCommandKind : uint8_t
   Reset,
   Drive,
   Turn,
+  ClimbMode,
 };
 
 struct WifiTuningCommand

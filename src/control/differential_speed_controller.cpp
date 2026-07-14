@@ -22,7 +22,8 @@ void DifferentialSpeedController::reset()
 }
 
 float DifferentialSpeedController::update(float targetDifferentialSpeedMps, float leftSpeedMps,
-                                          float rightSpeedMps, float deltaSeconds)
+                                          float rightSpeedMps, float deltaSeconds,
+                                          float maximumTurnMotorCommandOverride)
 {
   if (deltaSeconds <= 0.0F)
   {
@@ -52,7 +53,10 @@ float DifferentialSpeedController::update(float targetDifferentialSpeedMps, floa
       _configuration.integralLimit);
   const float proportionalTerm = _tuning.proportionalGain * _state.differentialSpeedErrorMps;
   const float candidateOutput = proportionalTerm + _tuning.integralGain * candidateIntegral;
-  const float outputLimit = _tuning.maximumTurnMotorCommand;
+  const float outputLimit = maximumTurnMotorCommandOverride < 0.0F
+                                ? _tuning.maximumTurnMotorCommand
+                                : clamp(maximumTurnMotorCommandOverride,
+                                        kAbsoluteMaximumTurnMotorCommand);
   const bool saturatedHigh = candidateOutput > outputLimit && _state.differentialSpeedErrorMps > 0.0F;
   const bool saturatedLow = candidateOutput < -outputLimit && _state.differentialSpeedErrorMps < 0.0F;
   if (!saturatedHigh && !saturatedLow)

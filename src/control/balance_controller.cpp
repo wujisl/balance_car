@@ -21,7 +21,8 @@ void BalanceController::reset()
   _state = {};
 }
 
-float BalanceController::update(const AttitudeState &attitude, float velocityPitchOffsetDegrees)
+float BalanceController::update(const AttitudeState &attitude, float velocityPitchOffsetDegrees,
+                                float maximumMotorCommandOverride)
 {
   _state = {};
   _state.requestedPitchDegrees = _tuning.targetPitchDegrees + velocityPitchOffsetDegrees;
@@ -53,13 +54,18 @@ float BalanceController::update(const AttitudeState &attitude, float velocityPit
   }
   _state.motorCommandRaw = motorCommand;
 
-  if (motorCommand > _tuning.maximumMotorCommand)
+  const float maximumMotorCommand = maximumMotorCommandOverride < 0.0F
+                                        ? _tuning.maximumMotorCommand
+                                        : (maximumMotorCommandOverride > kAbsoluteMaximumMotorCommand
+                                               ? kAbsoluteMaximumMotorCommand
+                                               : maximumMotorCommandOverride);
+  if (motorCommand > maximumMotorCommand)
   {
-    return _tuning.maximumMotorCommand;
+    return maximumMotorCommand;
   }
-  if (motorCommand < -_tuning.maximumMotorCommand)
+  if (motorCommand < -maximumMotorCommand)
   {
-    return -_tuning.maximumMotorCommand;
+    return -maximumMotorCommand;
   }
   return motorCommand;
 }
