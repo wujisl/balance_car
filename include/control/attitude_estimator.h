@@ -20,7 +20,7 @@ public:
   explicit AttitudeEstimator(const config::AttitudeConfiguration &configuration);
 
   void reset();
-  AttitudeState update(const drivers::ImuSample &sample);
+  AttitudeState update(const drivers::ImuSample &sample, bool useAccelerometerCorrection = true);
   const AttitudeState &state() const;
 
 private:

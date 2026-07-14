@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app/airborne_landing_manager.h"
 #include "app/offline_arm_control.h"
 #include "app/safety_manager.h"
 #include "app/self_test.h"
@@ -12,6 +13,8 @@
 #include "config/vehicle_config.h"
 #include "control/attitude_estimator.h"
 #include "control/balance_controller.h"
+#include "control/differential_speed_controller.h"
+#include "control/differential_odometry.h"
 #include "control/motion_command.h"
 #include "control/motor_mixer.h"
 #include "control/velocity_controller.h"
@@ -40,11 +43,17 @@ namespace
       balance_car::config::kBalanceConfiguration);
   balance_car::control::VelocityController velocityController(
       balance_car::config::kVelocityConfiguration);
+  balance_car::control::DifferentialSpeedController differentialSpeedController(
+      balance_car::config::kDifferentialSpeedConfiguration);
+  balance_car::control::DifferentialOdometry differentialOdometry(
+      balance_car::config::kOdometryConfiguration);
   balance_car::control::MotionCommand motionCommand(
       balance_car::config::kMotionConfiguration);
   balance_car::app::SelfTest selfTest(motorDriver, encoderDriver, imuDriver);
   balance_car::app::SafetyManager safetyManager(
       motorDriver, balance_car::config::kSafetyConfiguration);
+  balance_car::app::AirborneLandingManager airborneLandingManager(
+      balance_car::config::kAirborneLandingConfiguration);
   balance_car::app::OfflineArmControl offlineArmControl(
       balance_car::config::kBalanceArmButtonPin, balance_car::config::kSafetyConfiguration.offlineArmHoldMs);
   balance_car::app::WifiDebugServer wifiDebugServer(balance_car::config::kWifiDebugConfiguration);
@@ -96,6 +105,7 @@ namespace
   balance_car::control::MixedMotorCommand latestMixedMotorCommand = {};
   float latestBalanceMotorCommand = 0.0F;
   float latestVelocityPitchOffsetDegrees = 0.0F;
+  float latestTurnMotorCommand = 0.0F;
   float wifiDriveRequestedSpeedMps = 0.0F;
   bool wifiDriveSlewActive = false;
   uint32_t lastControlUpdateMs = 0;
@@ -108,9 +118,10 @@ namespace
   void printHelp()
   {
     Serial.println("[CMD] h/help s/status b/arm x/stop 1..6=motor-test");
-    Serial.println("[CMD] w/z speed+/- c=speed-zero a/d turn-/+ f=turn-zero");
+    Serial.println("[CMD] w/z speed+/- c=speed-zero a/d diff-speed-/+ f=diff-speed-zero");
     Serial.println("[CMD] set balance kp|ki|kd|trim <value>");
     Serial.println("[CMD] set speed kp|ki|target|invert <value>");
+    Serial.println("[CMD] set turn kp|ki|max|invert <value>");
     Serial.println("[CMD] set motion speed|turn <value>");
     Serial.println("[CMD] Hold BOOT for 1.5 seconds in STANDBY to arm offline balance; press BOOT while balancing to stop.");
   }
@@ -120,6 +131,8 @@ namespace
     const balance_car::control::BalanceTuning balanceTuning = balanceController.tuning();
     const balance_car::control::VelocityTuning velocityTuning = velocityController.tuning();
     const balance_car::control::VelocityState velocityState = velocityController.state();
+    const balance_car::control::DifferentialSpeedTuning turnTuning = differentialSpeedController.tuning();
+    const balance_car::control::DifferentialSpeedState turnState = differentialSpeedController.state();
     Serial.print("[STATUS] STATE=");
     Serial.print(balance_car::app::SafetyManager::stateName(safetyManager.state()));
     Serial.print(" FAULT=");
@@ -130,8 +143,16 @@ namespace
     Serial.print(motionCommand.targetSpeedMps(), 3);
     Serial.print(" FILTERED_SPEED=");
     Serial.print(velocityState.filteredSpeedMps, 3);
-    Serial.print(" TURN=");
-    Serial.println(motionCommand.turnCommand(), 3);
+    Serial.print(" TARGET_DIFF_SPEED=");
+    Serial.print(motionCommand.targetDifferentialSpeedMps(), 3);
+    Serial.print(" FILTERED_DIFF_SPEED=");
+    Serial.print(turnState.filteredDifferentialSpeedMps, 3);
+    Serial.print(" TURN_OUTPUT=");
+    Serial.println(latestTurnMotorCommand, 3);
+    Serial.print("[LANDING] ENABLED=");
+    Serial.print(airborneLandingManager.isEnabled() ? 1 : 0);
+    Serial.print(" STATE=");
+    Serial.println(balance_car::app::AirborneLandingManager::stateName(airborneLandingManager.state()));
     Serial.print("[TUNING] BALANCE_KP=");
     Serial.print(balanceTuning.proportionalGain, 4);
     Serial.print(" KI=");
@@ -149,15 +170,21 @@ namespace
     Serial.print(" MAX_MOTOR=");
     Serial.print(balanceTuning.maximumMotorCommand, 3);
     Serial.print(" MAX_PITCH_OFFSET=");
-    Serial.println(velocityTuning.maximumPitchOffsetDegrees, 3);
+    Serial.print(velocityTuning.maximumPitchOffsetDegrees, 3);
+    Serial.print(" TURN_KP=");
+    Serial.print(turnTuning.proportionalGain, 3);
+    Serial.print(" TURN_KI=");
+    Serial.print(turnTuning.integralGain, 3);
+    Serial.print(" MAX_TURN_OUTPUT=");
+    Serial.println(turnTuning.maximumTurnMotorCommand, 3);
   }
 
   void printMotionCommand()
   {
     Serial.print("[MOTION] TARGET_SPEED_MPS=");
     Serial.print(motionCommand.targetSpeedMps(), 3);
-    Serial.print(" TURN_COMMAND=");
-    Serial.println(motionCommand.turnCommand(), 3);
+    Serial.print(" TARGET_DIFF_SPEED_MPS=");
+    Serial.println(motionCommand.targetDifferentialSpeedMps(), 3);
   }
 
   void requestMotorTest(float leftPower, float rightPower)
@@ -176,12 +203,16 @@ namespace
     {
       balanceController.reset();
       velocityController.reset();
+      differentialSpeedController.reset();
+      differentialOdometry.reset();
+      airborneLandingManager.reset();
       motionCommand.clear();
       motionCommand.setTargetSpeedMps(balance_car::config::kMotionConfiguration.initialTargetSpeedMps);
       wifiDriveRequestedSpeedMps = 0.0F;
       wifiDriveSlewActive = false;
       latestBalanceMotorCommand = 0.0F;
       latestVelocityPitchOffsetDegrees = 0.0F;
+      latestTurnMotorCommand = 0.0F;
       Serial.print("[BALANCE] STATE=ACTIVE INITIAL_TARGET_SPEED_MPS=");
       Serial.println(motionCommand.targetSpeedMps(), 3);
       return true;
@@ -195,11 +226,15 @@ namespace
     safetyManager.disarm();
     balanceController.reset();
     velocityController.reset();
+    differentialSpeedController.reset();
+    differentialOdometry.reset();
+    airborneLandingManager.reset();
     motionCommand.clear();
     wifiDriveRequestedSpeedMps = 0.0F;
     wifiDriveSlewActive = false;
     latestBalanceMotorCommand = 0.0F;
     latestVelocityPitchOffsetDegrees = 0.0F;
+    latestTurnMotorCommand = 0.0F;
     latestMixedMotorCommand = {};
   }
 
@@ -207,6 +242,57 @@ namespace
   {
     wifiDriveRequestedSpeedMps = 0.0F;
     wifiDriveSlewActive = false;
+  }
+
+  void handleAirborneLandingEvent(balance_car::app::AirborneLandingEvent event)
+  {
+    using balance_car::app::AirborneLandingEvent;
+    switch (event)
+    {
+    case AirborneLandingEvent::EnteredAirborne:
+      // Ground-speed and differential-speed feedback are invalid without tire
+      // contact. Drop motion requests before the landing recovery sequence.
+      motionCommand.clear();
+      cancelWifiDriveSlew();
+      balanceController.reset();
+      velocityController.reset();
+      differentialSpeedController.reset();
+      latestBalanceMotorCommand = 0.0F;
+      latestVelocityPitchOffsetDegrees = 0.0F;
+      latestTurnMotorCommand = 0.0F;
+      latestMixedMotorCommand = {};
+      Serial.println("[LANDING] STATE=AIRBORNE; motion commands cleared, motor output held");
+      break;
+
+    case AirborneLandingEvent::ResetAttitude:
+      // The manager has observed normal gravity for the configured settling
+      // interval. Re-anchor pitch before gradually restoring balance output.
+      attitudeEstimator.reset();
+      balanceController.reset();
+      velocityController.reset();
+      differentialSpeedController.reset();
+      differentialOdometry.reset();
+      latestVelocityPitchOffsetDegrees = 0.0F;
+      latestTurnMotorCommand = 0.0F;
+      Serial.println("[LANDING] STATE=RECOVERING; attitude reset, motor output ramping");
+      break;
+
+    case AirborneLandingEvent::RecoveryComplete:
+      Serial.println("[LANDING] STATE=GROUNDED; normal control resumed");
+      break;
+
+    case AirborneLandingEvent::Fault:
+      safetyManager.reportFault(balance_car::app::FaultCode::AirborneLandingFailed);
+      latestBalanceMotorCommand = 0.0F;
+      latestVelocityPitchOffsetDegrees = 0.0F;
+      latestTurnMotorCommand = 0.0F;
+      latestMixedMotorCommand = {};
+      Serial.println("[LANDING] STATE=FAULT; landing recovery timed out");
+      break;
+
+    case AirborneLandingEvent::None:
+      break;
+    }
   }
 
   bool requestWifiDriveSpeed(float speedMps)
@@ -324,6 +410,30 @@ namespace
         return;
       }
     }
+    else if (strcmp(domain, "turn") == 0)
+    {
+      if (strcmp(parameter, "kp") == 0)
+      {
+        differentialSpeedController.setProportionalGain(value);
+      }
+      else if (strcmp(parameter, "ki") == 0)
+      {
+        differentialSpeedController.setIntegralGain(value);
+      }
+      else if (strcmp(parameter, "max") == 0)
+      {
+        differentialSpeedController.setMaximumTurnMotorCommand(value);
+      }
+      else if (strcmp(parameter, "invert") == 0)
+      {
+        differentialSpeedController.setOutputInverted(value >= 0.5F);
+      }
+      else
+      {
+        Serial.println("[CMD] UNKNOWN_TURN_PARAMETER");
+        return;
+      }
+    }
     else if (strcmp(domain, "motion") == 0)
     {
       if (strcmp(parameter, "speed") == 0)
@@ -333,7 +443,7 @@ namespace
       }
       else if (strcmp(parameter, "turn") == 0)
       {
-        motionCommand.setTurnCommand(value);
+        motionCommand.setTargetDifferentialSpeedMps(value);
       }
       else
       {
@@ -533,6 +643,17 @@ namespace
       else
         return false;
     }
+    else if (strcmp(command.domain, "turn") == 0)
+    {
+      if (strcmp(command.parameter, "kp") == 0)
+        differentialSpeedController.setProportionalGain(command.value);
+      else if (strcmp(command.parameter, "ki") == 0)
+        differentialSpeedController.setIntegralGain(command.value);
+      else if (strcmp(command.parameter, "max") == 0)
+        differentialSpeedController.setMaximumTurnMotorCommand(command.value);
+      else
+        return false;
+    }
     else
     {
       return false;
@@ -546,6 +667,7 @@ namespace
   {
     const balance_car::control::BalanceTuning balanceTuning = balanceController.tuning();
     const balance_car::control::VelocityTuning velocityTuning = velocityController.tuning();
+    const balance_car::control::DifferentialSpeedTuning turnTuning = differentialSpeedController.tuning();
     if (strcmp(command.domain, "balance") == 0)
     {
       if (strcmp(command.parameter, "kp") == 0) return balanceTuning.proportionalGain;
@@ -559,6 +681,12 @@ namespace
       if (strcmp(command.parameter, "kp") == 0) return velocityTuning.proportionalGain;
       if (strcmp(command.parameter, "ki") == 0) return velocityTuning.integralGain;
       if (strcmp(command.parameter, "max_pitch") == 0) return velocityTuning.maximumPitchOffsetDegrees;
+    }
+    if (strcmp(command.domain, "turn") == 0)
+    {
+      if (strcmp(command.parameter, "kp") == 0) return turnTuning.proportionalGain;
+      if (strcmp(command.parameter, "ki") == 0) return turnTuning.integralGain;
+      if (strcmp(command.parameter, "max") == 0) return turnTuning.maximumTurnMotorCommand;
     }
     return 0.0F;
   }
@@ -602,7 +730,7 @@ namespace
       {
         if (safetyManager.isBalancing())
         {
-          motionCommand.setTurnCommand(command.value);
+          motionCommand.setTargetDifferentialSpeedMps(command.value);
           wifiDebugServer.sendCommandResult(command.requestSequence, true, "TURN_ACCEPTED");
         }
         else
@@ -631,9 +759,11 @@ namespace
   void publishWifiTelemetry(uint32_t nowMs)
   {
     const balance_car::control::VelocityState velocityState = velocityController.state();
+    const balance_car::control::DifferentialSpeedState turnState = differentialSpeedController.state();
     const balance_car::control::BalanceTuning balanceTuning = balanceController.tuning();
     const balance_car::control::BalanceState balanceState = balanceController.state();
     const balance_car::control::VelocityTuning velocityTuning = velocityController.tuning();
+    const balance_car::control::DifferentialSpeedTuning turnTuning = differentialSpeedController.tuning();
     balance_car::app::WifiTelemetry telemetry = {};
     telemetry.timestampMs = nowMs;
     telemetry.safetyState = static_cast<uint8_t>(safetyManager.state());
@@ -652,7 +782,11 @@ namespace
     telemetry.filteredSpeedMps = velocityState.filteredSpeedMps;
     telemetry.speedErrorMps = velocityState.speedErrorMps;
     telemetry.speedPitchOffsetDegrees = latestVelocityPitchOffsetDegrees;
-    telemetry.turnCommand = motionCommand.turnCommand();
+    telemetry.turnCommand = motionCommand.targetDifferentialSpeedMps();
+    telemetry.filteredDifferentialSpeedMps = turnState.filteredDifferentialSpeedMps;
+    telemetry.differentialSpeedErrorMps = turnState.differentialSpeedErrorMps;
+    telemetry.turnMotorCommand = latestTurnMotorCommand;
+    telemetry.appliedTurnMotorCommand = latestMixedMotorCommand.appliedTurnCommand;
     telemetry.leftMotorCommand = latestMixedMotorCommand.left;
     telemetry.rightMotorCommand = latestMixedMotorCommand.right;
     telemetry.leftWheelSpeedMps = latestWheelSpeed.leftMetersPerSecond;
@@ -670,8 +804,14 @@ namespace
     telemetry.speedKp = velocityTuning.proportionalGain;
     telemetry.speedKi = velocityTuning.integralGain;
     telemetry.speedInverted = velocityTuning.outputInverted;
+    telemetry.turnKp = turnTuning.proportionalGain;
+    telemetry.turnKi = turnTuning.integralGain;
+    telemetry.maximumTurnMotorCommand = turnTuning.maximumTurnMotorCommand;
+    telemetry.turnInverted = turnTuning.outputInverted;
     telemetry.maximumMotorCommand = balanceTuning.maximumMotorCommand;
     telemetry.maximumPitchOffsetDegrees = velocityTuning.maximumPitchOffsetDegrees;
+    telemetry.headingDegrees = differentialOdometry.state().headingDegrees;
+    telemetry.yawRateDegreesPerSecond = differentialOdometry.state().yawRateDegreesPerSecond;
     wifiDebugServer.publish(telemetry, nowMs);
   }
 
@@ -685,10 +825,13 @@ namespace
     const uint32_t elapsedMs = nowMs - lastVelocityUpdateMs;
     lastVelocityUpdateMs = nowMs;
     latestWheelSpeed = encoderDriver.sample(static_cast<float>(elapsedMs) / 1000.0F);
-    if (!safetyManager.isBalancing())
+    if (!safetyManager.isBalancing() || !airborneLandingManager.allowMotionControl())
     {
       velocityController.reset();
+      differentialSpeedController.reset();
+      differentialOdometry.reset();
       latestVelocityPitchOffsetDegrees = 0.0F;
+      latestTurnMotorCommand = 0.0F;
       return;
     }
 
@@ -697,6 +840,10 @@ namespace
     updateWifiDriveTarget(static_cast<float>(elapsedMs) / 1000.0F);
     latestVelocityPitchOffsetDegrees = velocityController.update(
         motionCommand.targetSpeedMps(), measuredSpeedMps, static_cast<float>(elapsedMs) / 1000.0F);
+    latestTurnMotorCommand = differentialSpeedController.update(
+        motionCommand.targetDifferentialSpeedMps(), latestWheelSpeed.leftMetersPerSecond,
+        latestWheelSpeed.rightMetersPerSecond, static_cast<float>(elapsedMs) / 1000.0F);
+    differentialOdometry.update(latestWheelSpeed, static_cast<float>(elapsedMs) / 1000.0F);
   }
 
   void updateBalanceControl(uint32_t nowMs)
@@ -708,19 +855,33 @@ namespace
 
     lastControlUpdateMs = nowMs;
     latestImuSample = imuDriver.read();
-    latestAttitude = attitudeEstimator.update(latestImuSample);
-    safetyManager.monitorBalance(latestAttitude.pitchDegrees, latestAttitude.valid, imuDriver.isHealthy());
+    handleAirborneLandingEvent(airborneLandingManager.update(latestImuSample, nowMs));
+    latestAttitude = attitudeEstimator.update(
+        latestImuSample, airborneLandingManager.useAccelerometerCorrection());
+    safetyManager.monitorBalance(latestAttitude.pitchDegrees, latestAttitude.valid, imuDriver.isHealthy(),
+                                 airborneLandingManager.enforcePitchLimit());
 
     if (!safetyManager.isBalancing())
     {
       latestBalanceMotorCommand = 0.0F;
+      latestTurnMotorCommand = 0.0F;
       latestMixedMotorCommand = {};
+      return;
+    }
+
+    if (airborneLandingManager.holdMotorOutput())
+    {
+      latestBalanceMotorCommand = 0.0F;
+      latestTurnMotorCommand = 0.0F;
+      latestMixedMotorCommand = {};
+      motorDriver.setNormalized(0.0F, 0.0F);
       return;
     }
 
     latestBalanceMotorCommand = balanceController.update(latestAttitude, latestVelocityPitchOffsetDegrees);
     latestMixedMotorCommand = balance_car::control::MotorMixer::mix(
-        latestBalanceMotorCommand, motionCommand.turnCommand());
+        latestBalanceMotorCommand, latestTurnMotorCommand,
+        balanceController.tuning().maximumMotorCommand * airborneLandingManager.motorOutputScale(nowMs));
     motorDriver.setNormalized(latestMixedMotorCommand.left, latestMixedMotorCommand.right);
   }
 
@@ -733,6 +894,7 @@ namespace
 
     lastTelemetryMs = nowMs;
     const balance_car::control::VelocityState velocityState = velocityController.state();
+    const balance_car::control::DifferentialSpeedState turnState = differentialSpeedController.state();
     Serial.print("[TELEMETRY] pitch_deg=");
     Serial.print(latestAttitude.pitchDegrees, 2);
     Serial.print(" accel_pitch_deg=");
@@ -759,8 +921,14 @@ namespace
     Serial.print(velocityState.speedErrorMps, 3);
     Serial.print(" speed_pitch_offset_deg=");
     Serial.print(latestVelocityPitchOffsetDegrees, 3);
-    Serial.print(" turn=");
-    Serial.print(motionCommand.turnCommand(), 3);
+    Serial.print(" target_diff_speed_mps=");
+    Serial.print(motionCommand.targetDifferentialSpeedMps(), 3);
+    Serial.print(" measured_diff_speed_mps=");
+    Serial.print(turnState.filteredDifferentialSpeedMps, 3);
+    Serial.print(" turn_output_requested_applied=");
+    Serial.print(latestTurnMotorCommand, 3);
+    Serial.print(',');
+    Serial.print(latestMixedMotorCommand.appliedTurnCommand, 3);
     Serial.print(" motor_lr=");
     Serial.print(latestMixedMotorCommand.left, 3);
     Serial.print(',');

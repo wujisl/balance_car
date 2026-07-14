@@ -24,6 +24,7 @@ enum class FaultCode
   SelfTestFailed,
   ImuUnhealthy,
   PitchLimitExceeded,
+  AirborneLandingFailed,
 };
 
 class SafetyManager
@@ -35,7 +36,8 @@ public:
   void completeSelfTest(const SelfTestReport &report);
   bool requestManualMotorTest(float leftPower, float rightPower, uint32_t nowMs);
   bool requestBalance(float pitchDegrees, bool attitudeValid, bool imuHealthy);
-  void monitorBalance(float pitchDegrees, bool attitudeValid, bool imuHealthy);
+  void monitorBalance(float pitchDegrees, bool attitudeValid, bool imuHealthy,
+                      bool enforcePitchLimit = true);
   void disarm();
   void reportFault(FaultCode faultCode);
   void update(uint32_t nowMs);

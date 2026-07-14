@@ -20,9 +20,12 @@ bool isAllowedParameter(const char *domain, const char *parameter)
           (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
            strcmp(parameter, "kd") == 0 || strcmp(parameter, "trim") == 0 ||
            strcmp(parameter, "max_motor") == 0)) ||
-         (strcmp(domain, "speed") == 0 &&
-          (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
-           strcmp(parameter, "max_pitch") == 0));
+          (strcmp(domain, "speed") == 0 &&
+           (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
+            strcmp(parameter, "max_pitch") == 0)) ||
+          (strcmp(domain, "turn") == 0 &&
+           (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
+            strcmp(parameter, "max") == 0));
 }
 
 void toLowercase(char *text)
@@ -70,8 +73,8 @@ void WifiDebugServer::begin()
            _configuration.telemetryPort, _configuration.commandPort);
   writeConsoleBytes(reinterpret_cast<const uint8_t *>(startupLine), strlen(startupLine));
   writeConsoleByte('\n');
-  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,1 fields=31 logs=L,seq,text subscription=H"),
-                    strlen("[WIFI] DEBUG telemetry=T,1 fields=31 logs=L,seq,text subscription=H"));
+  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"),
+                    strlen("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"));
   writeConsoleByte('\n');
 }
 
@@ -168,12 +171,14 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,3,%lu,%lu,%u,%u,%u,"
+      "T,5,%lu,%lu,%u,%u,%u,"
       "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
       "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
       "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
       "%.3f,%.3f,%.3f,"       // target, filtered, error speed
-      "%.3f,%.3f,"             // speed pitch offset, turn
+      "%.3f,"                  // speed pitch offset
+      "%.3f,%.3f,%.3f,%.3f,"  // target/filtered/error differential speed, turn command
+      "%.3f,"                  // turn command after mixer headroom limit
       "%.3f,%.3f,"             // left/right motor command
       "%.5f,%.5f,%.5f,"       // balance Kp/Ki/Kd
       "%.3f,"                   // balance trim
@@ -182,7 +187,9 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       "%.3f,%.3f,"              // left/right wheel speed
       "%.3f,%.3f,"              // requested pitch, balance pitch error
       "%.5f,%.5f,%.5f,"         // balance P/I/D terms
-      "%.5f,%u\n",             // raw balance motor command, speed output inverted
+      "%.5f,%u,"               // raw balance motor command, speed output inverted
+      "%.5f,%.5f,%.3f,%u,"    // turn Kp/Ki/max command, output inverted
+      "%.3f,%.3f\n",          // relative heading, filtered yaw rate
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -192,7 +199,10 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.accelXG, telemetry.accelYG, telemetry.accelZG,
       telemetry.gyroXDps, telemetry.gyroYDps, telemetry.gyroZDps,
       telemetry.targetSpeedMps, telemetry.filteredSpeedMps, telemetry.speedErrorMps,
-      telemetry.speedPitchOffsetDegrees, telemetry.turnCommand,
+      telemetry.speedPitchOffsetDegrees,
+      telemetry.turnCommand, telemetry.filteredDifferentialSpeedMps,
+      telemetry.differentialSpeedErrorMps, telemetry.turnMotorCommand,
+      telemetry.appliedTurnMotorCommand,
       telemetry.leftMotorCommand, telemetry.rightMotorCommand,
       telemetry.balanceKp, telemetry.balanceKi, telemetry.balanceKd,
       telemetry.balanceTrimDegrees, telemetry.speedKp, telemetry.speedKi,
@@ -200,7 +210,10 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.leftWheelSpeedMps, telemetry.rightWheelSpeedMps,
       telemetry.requestedPitchDegrees, telemetry.balancePitchErrorDegrees,
       telemetry.balanceProportionalTerm, telemetry.balanceIntegralTerm, telemetry.balanceDerivativeTerm,
-      telemetry.balanceMotorRaw, telemetry.speedInverted ? 1U : 0U);
+      telemetry.balanceMotorRaw, telemetry.speedInverted ? 1U : 0U,
+      telemetry.turnKp, telemetry.turnKi, telemetry.maximumTurnMotorCommand,
+      telemetry.turnInverted ? 1U : 0U,
+      telemetry.headingDegrees, telemetry.yawRateDegreesPerSecond);
   if (length <= 0 || length >= static_cast<int>(sizeof(packet)))
   {
     return;

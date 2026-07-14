@@ -13,9 +13,12 @@ public:
   void adjustTargetSpeedMps(float deltaMps);
   void setTurnCommand(float turnCommand);
   void adjustTurnCommand(float deltaCommand);
+  void setTargetDifferentialSpeedMps(float targetDifferentialSpeedMps);
+  void adjustTargetDifferentialSpeedMps(float deltaMps);
   void clear();
   float targetSpeedMps() const;
   float turnCommand() const;
+  float targetDifferentialSpeedMps() const;
 
 private:
   float clampSpeed(float value) const;

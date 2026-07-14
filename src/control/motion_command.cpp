@@ -26,6 +26,16 @@ void MotionCommand::adjustTurnCommand(float deltaCommand)
   setTurnCommand(_turnCommand + deltaCommand);
 }
 
+void MotionCommand::setTargetDifferentialSpeedMps(float targetDifferentialSpeedMps)
+{
+  setTurnCommand(targetDifferentialSpeedMps);
+}
+
+void MotionCommand::adjustTargetDifferentialSpeedMps(float deltaMps)
+{
+  adjustTurnCommand(deltaMps);
+}
+
 void MotionCommand::clear()
 {
   _targetSpeedMps = 0.0F;
@@ -38,6 +48,11 @@ float MotionCommand::targetSpeedMps() const
 }
 
 float MotionCommand::turnCommand() const
+{
+  return _turnCommand;
+}
+
+float MotionCommand::targetDifferentialSpeedMps() const
 {
   return _turnCommand;
 }

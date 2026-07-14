@@ -14,7 +14,7 @@ void AttitudeEstimator::reset()
   _state = {};
 }
 
-AttitudeState AttitudeEstimator::update(const drivers::ImuSample &sample)
+AttitudeState AttitudeEstimator::update(const drivers::ImuSample &sample, bool useAccelerometerCorrection)
 {
   if (!sample.valid)
   {
@@ -56,10 +56,17 @@ AttitudeState AttitudeEstimator::update(const drivers::ImuSample &sample)
   else
   {
     const float predictedPitchDegrees = _state.pitchDegrees + pitchRateDps * deltaSeconds;
-    const float filterAlpha = _configuration.complementaryFilterTimeConstantSeconds /
-                              (_configuration.complementaryFilterTimeConstantSeconds + deltaSeconds);
-    _state.pitchDegrees = filterAlpha * predictedPitchDegrees +
-                          (1.0F - filterAlpha) * accelerometerPitchDegrees;
+    if (!useAccelerometerCorrection)
+    {
+      _state.pitchDegrees = predictedPitchDegrees;
+    }
+    else
+    {
+      const float filterAlpha = _configuration.complementaryFilterTimeConstantSeconds /
+                                (_configuration.complementaryFilterTimeConstantSeconds + deltaSeconds);
+      _state.pitchDegrees = filterAlpha * predictedPitchDegrees +
+                            (1.0F - filterAlpha) * accelerometerPitchDegrees;
+    }
   }
 
   _state.pitchRateDps = pitchRateDps;

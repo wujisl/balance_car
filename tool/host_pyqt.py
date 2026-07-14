@@ -594,13 +594,37 @@ class BalanceTelemetryWorker(QThread):
     @staticmethod
     def _parse_telemetry(text: str):
         parts = text.split(",")
-        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"]):
+        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "4"], ["T", "5"]):
             return None
-        expected_fields = {"1": 31, "2": 33, "3": 40}[parts[1]]
+        expected_fields = {"1": 31, "2": 33, "3": 40, "4": 48, "5": 50}[parts[1]]
         if len(parts) != expected_fields:
             return None
         try:
             values = [float(value) for value in parts[7:]]
+            if parts[1] in ("4", "5"):
+                return {
+                    "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
+                    "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
+                    "pitch": values[0], "pitch_rate": values[1], "accel_pitch": values[2],
+                    "accel_x": values[3], "accel_y": values[4], "accel_z": values[5],
+                    "gyro_x": values[6], "gyro_y": values[7], "gyro_z": values[8],
+                    "target_speed": values[9], "filtered_speed": values[10], "speed_error": values[11],
+                    "pitch_offset": values[12], "turn": values[13],
+                    "differential_speed": values[14], "differential_speed_error": values[15],
+                    "turn_motor_command": values[16], "applied_turn_motor_command": values[17],
+                    "motor_left": values[18], "motor_right": values[19],
+                    "balance_kp": values[20], "balance_ki": values[21], "balance_kd": values[22],
+                    "balance_trim": values[23], "speed_kp": values[24], "speed_ki": values[25],
+                    "max_motor": values[26], "max_pitch": values[27],
+                    "wheel_left": values[28], "wheel_right": values[29],
+                    "requested_pitch": values[30], "balance_pitch_error": values[31],
+                    "balance_p_term": values[32], "balance_i_term": values[33],
+                    "balance_d_term": values[34], "balance_motor_raw": values[35],
+                    "speed_invert": int(values[36]), "turn_kp": values[37], "turn_ki": values[38],
+                    "max_turn": values[39], "turn_invert": int(values[40]),
+                    "heading": values[41] if parts[1] == "5" else None,
+                    "yaw_rate": values[42] if parts[1] == "5" else None,
+                }
             return {
                 "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
                 "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
@@ -622,6 +646,9 @@ class BalanceTelemetryWorker(QThread):
                 "balance_d_term": values[30] if parts[1] == "3" else None,
                 "balance_motor_raw": values[31] if parts[1] == "3" else None,
                 "speed_invert": int(values[32]) if parts[1] == "3" else None,
+                "differential_speed": None, "differential_speed_error": None,
+                "turn_motor_command": None, "applied_turn_motor_command": None,
+                "turn_kp": None, "turn_ki": None, "max_turn": None, "turn_invert": None,
             }
         except ValueError:
             return None
@@ -1031,27 +1058,47 @@ class MainWindow(QMainWindow):
         self.btn_balance_drive_zero.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_drive_zero, 3, 6, 1, 2)
 
-        connection_grid.addWidget(QLabel("自动路线:"), 4, 0)
+        connection_grid.addWidget(QLabel("转向差速度给定 (右-左, m/s):"), 4, 0, 1, 2)
+        self.spin_balance_turn_speed = QDoubleSpinBox()
+        self.spin_balance_turn_speed.setDecimals(3)
+        self.spin_balance_turn_speed.setRange(-0.200, 0.200)
+        self.spin_balance_turn_speed.setSingleStep(0.010)
+        self.spin_balance_turn_speed.setValue(0.0)
+        self.spin_balance_turn_speed.setEnabled(False)
+        self.spin_balance_turn_speed.setToolTip(
+            "仅在 BALANCING 状态下可下发；正值表示右轮比左轮快，负值表示左轮比右轮快"
+        )
+        connection_grid.addWidget(self.spin_balance_turn_speed, 4, 2)
+        self.btn_balance_turn = QPushButton("设置转向差速度")
+        self.btn_balance_turn.clicked.connect(self.request_balance_turn_speed)
+        self.btn_balance_turn.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_turn, 4, 3, 1, 2)
+        self.btn_balance_turn_zero = QPushButton("转向差速度清零")
+        self.btn_balance_turn_zero.clicked.connect(self.request_balance_turn_zero)
+        self.btn_balance_turn_zero.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_turn_zero, 4, 5, 1, 3)
+
+        connection_grid.addWidget(QLabel("自动路线:"), 5, 0)
         self.cmb_route_direction = QComboBox()
         self.cmb_route_direction.addItems(["左转（两次半圆）", "右转（两次半圆）"])
-        connection_grid.addWidget(self.cmb_route_direction, 4, 1, 1, 2)
+        connection_grid.addWidget(self.cmb_route_direction, 5, 1, 1, 2)
         self.spin_route_turn = QDoubleSpinBox()
         self.spin_route_turn.setRange(0.01, 0.20)
         self.spin_route_turn.setDecimals(3)
         self.spin_route_turn.setSingleStep(0.01)
         self.spin_route_turn.setValue(0.060)
-        self.spin_route_turn.setToolTip("转向混控量，需通过实际半径校准；轮距 0.20 m、目标半径 0.25 m")
-        connection_grid.addWidget(self.spin_route_turn, 4, 3)
+        self.spin_route_turn.setToolTip("目标右减左轮速差（m/s）；需通过实际转弯半径校准")
+        connection_grid.addWidget(self.spin_route_turn, 5, 3)
         self.btn_route_start = QPushButton("执行 2m-半圆-2m-半圆")
         self.btn_route_start.clicked.connect(self.start_route)
         self.btn_route_start.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_start, 4, 4, 1, 2)
+        connection_grid.addWidget(self.btn_route_start, 5, 4, 1, 2)
         self.btn_route_cancel = QPushButton("取消路线")
         self.btn_route_cancel.clicked.connect(self.cancel_route)
         self.btn_route_cancel.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_cancel, 4, 6)
+        connection_grid.addWidget(self.btn_route_cancel, 5, 6)
         self.lbl_route_status = QLabel("路线未运行")
-        connection_grid.addWidget(self.lbl_route_status, 5, 0, 1, 8)
+        connection_grid.addWidget(self.lbl_route_status, 6, 0, 1, 8)
         layout.addWidget(connection_group)
 
         live_group = QGroupBox("实时状态")
@@ -1064,7 +1111,8 @@ class MainWindow(QMainWindow):
             ("accel", "加速度 g (X,Y,Z)"), ("gyro", "陀螺仪 °/s (X,Y,Z)"),
             ("speed", "目标 / 实际速度 (m/s)"), ("speed_error", "速度误差 (m/s)"),
             ("wheel_speed", "左右车轮线速度 (m/s)"),
-            ("pitch_offset", "速度环俯角输出 (°)"), ("turn", "转向量"),
+            ("heading", "相对航向 / 转向角速度 (° / °/s)"),
+            ("pitch_offset", "速度环俯角输出 (°)"), ("turn", "目标/实际差速度与转向输出"),
             ("motor", "左右电机输出"), ("packet", "包序号 / 包龄 / 频率"),
         ]
         for index, (key, title) in enumerate(status_fields):
@@ -1086,6 +1134,9 @@ class MainWindow(QMainWindow):
             ("balance_trim", "平衡点 Trim (°)", -2.09, 3),
             ("speed_kp", "速度 Kp", 11.0, 5),
             ("speed_ki", "速度 Ki", 0.15, 6),
+            ("turn_kp", "差速度 Kp", 1.0, 5),
+            ("turn_ki", "差速度 Ki", 0.0, 6),
+            ("max_turn", "最大转向输出 (0–1)", 0.20, 3),
             ("max_motor", "最大电机输出 (0–1)", 0.45, 3),
             ("max_pitch", "最大俯仰偏置 (°)", 6.0, 2),
         ]
@@ -1097,7 +1148,7 @@ class MainWindow(QMainWindow):
             if key == "balance_trim":
                 spin.setRange(-20.0, 20.0)
                 spin.setSingleStep(0.05)
-            elif key == "max_motor":
+            elif key in ("max_motor", "max_turn"):
                 spin.setRange(0.0, 1.0)
                 spin.setSingleStep(0.01)
             elif key == "max_pitch":
@@ -1116,12 +1167,12 @@ class MainWindow(QMainWindow):
         )
         self.btn_apply_balance_loop_tuning.clicked.connect(self.apply_balance_loop_tuning)
         self.btn_apply_balance_loop_tuning.setEnabled(False)
-        tuning_grid.addWidget(self.btn_apply_balance_loop_tuning, 3, 0, 1, 3)
+        tuning_grid.addWidget(self.btn_apply_balance_loop_tuning, 4, 0, 1, 3)
 
         self.btn_apply_balance_tuning = QPushButton("应用全部参数（含速度环）")
         self.btn_apply_balance_tuning.clicked.connect(self.apply_balance_tuning)
         self.btn_apply_balance_tuning.setEnabled(False)
-        tuning_grid.addWidget(self.btn_apply_balance_tuning, 3, 3, 1, 3)
+        tuning_grid.addWidget(self.btn_apply_balance_tuning, 4, 3, 1, 3)
         layout.addWidget(tuning_group)
 
         console_group = QGroupBox("主板串口日志镜像")
@@ -1209,6 +1260,9 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setEnabled(False)
         self.btn_balance_drive.setEnabled(False)
         self.btn_balance_drive_zero.setEnabled(False)
+        self.spin_balance_turn_speed.setEnabled(False)
+        self.btn_balance_turn.setEnabled(False)
+        self.btn_balance_turn_zero.setEnabled(False)
         self.btn_route_start.setEnabled(False)
         self.btn_route_cancel.setEnabled(False)
         self.balance_ip_edit.setEnabled(False)
@@ -1242,6 +1296,9 @@ class MainWindow(QMainWindow):
             self.spin_balance_drive_speed.setEnabled(False)
             self.btn_balance_drive.setEnabled(False)
             self.btn_balance_drive_zero.setEnabled(False)
+            self.spin_balance_turn_speed.setEnabled(False)
+            self.btn_balance_turn.setEnabled(False)
+            self.btn_balance_turn_zero.setEnabled(False)
             self.cancel_route(send_stop=False)
             self.btn_route_start.setEnabled(False)
             self.balance_ip_edit.setEnabled(True)
@@ -1272,6 +1329,10 @@ class MainWindow(QMainWindow):
                 "left_wheel_mps", "right_wheel_mps",
                 "balance_kp", "balance_ki", "balance_kd", "balance_trim",
                 "speed_kp", "speed_ki", "speed_invert", "target_speed",
+                "target_differential_speed_mps", "filtered_differential_speed_mps",
+                "differential_speed_error_mps", "turn_motor_command", "applied_turn_motor_command",
+                "turn_kp", "turn_ki", "max_turn", "turn_invert",
+                "relative_heading_deg", "yaw_rate_deg_per_s",
             ])
             self.speed_record_file.flush()
             self.log(f"速度记录已开始：{self.speed_record_path}")
@@ -1321,6 +1382,12 @@ class MainWindow(QMainWindow):
                 f"{telemetry['speed_kp']:.6f}", f"{telemetry['speed_ki']:.6f}",
                 "" if telemetry.get("speed_invert") is None else telemetry["speed_invert"],
                 f"{telemetry['target_speed']:.6f}",
+                f"{telemetry['turn']:.6f}", optional_float("differential_speed"),
+                optional_float("differential_speed_error"), optional_float("turn_motor_command"),
+                optional_float("applied_turn_motor_command"), optional_float("turn_kp"),
+                optional_float("turn_ki"), optional_float("max_turn"),
+                "" if telemetry.get("turn_invert") is None else telemetry["turn_invert"],
+                optional_float("heading"), optional_float("yaw_rate"),
             ])
             # 每包落盘，异常关闭时也最多损失当前一行记录。
             self.speed_record_file.flush()
@@ -1333,6 +1400,7 @@ class MainWindow(QMainWindow):
             ("balance", "kp", "balance_kp"), ("balance", "ki", "balance_ki"),
             ("balance", "kd", "balance_kd"), ("balance", "trim", "balance_trim"),
             ("speed", "kp", "speed_kp"), ("speed", "ki", "speed_ki"),
+            ("turn", "kp", "turn_kp"), ("turn", "ki", "turn_ki"), ("turn", "max", "max_turn"),
             ("balance", "max_motor", "max_motor"), ("speed", "max_pitch", "max_pitch"),
         ]
         self._send_tuning_commands(
@@ -1475,6 +1543,22 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setValue(0.0)
         self._send_balance_control("DRIVE", 0.0)
 
+    def request_balance_turn_speed(self):
+        if self.balance_worker is None:
+            self.log("请先连接主板 Wi-Fi 调试端口")
+            return
+        if self.route_active:
+            self.cancel_route()
+        self._send_balance_control("TURN", self.spin_balance_turn_speed.value())
+
+    def request_balance_turn_zero(self):
+        if self.balance_worker is None:
+            return
+        if self.route_active:
+            self.cancel_route()
+        self.spin_balance_turn_speed.setValue(0.0)
+        self._send_balance_control("TURN", 0.0)
+
     def _send_balance_control(self, action: str, value: float = None):
         self.balance_command_sequence += 1
         command = f"C,{self.balance_command_sequence},{action}"
@@ -1512,7 +1596,8 @@ class MainWindow(QMainWindow):
         if "rx_hz" in telemetry:
             self.balance_rx_hz = telemetry["rx_hz"]
         state_names = ["BOOT", "SELF_TESTING", "STANDBY", "MANUAL_TEST", "BALANCING", "FAULT"]
-        fault_names = ["NONE", "SELF_TEST_FAILED", "IMU_UNHEALTHY", "PITCH_LIMIT_EXCEEDED"]
+        fault_names = ["NONE", "SELF_TEST_FAILED", "IMU_UNHEALTHY", "PITCH_LIMIT_EXCEEDED",
+                       "AIRBORNE_LANDING_FAILED"]
         state = state_names[telemetry["state"]] if 0 <= telemetry["state"] < len(state_names) else "UNKNOWN"
         fault = fault_names[telemetry["fault"]] if 0 <= telemetry["fault"] < len(fault_names) else "UNKNOWN"
         value = self.balance_value_labels
@@ -1534,16 +1619,31 @@ class MainWindow(QMainWindow):
         value["wheel_speed"].setText(
             "-" if left_wheel is None else f"{left_wheel:.3f}, {right_wheel:.3f}"
         )
+        heading = telemetry.get("heading")
+        yaw_rate = telemetry.get("yaw_rate")
+        value["heading"].setText(
+            "-" if heading is None or yaw_rate is None else f"{heading:.2f} / {yaw_rate:.2f}"
+        )
         value["speed_error"].setText(f"{telemetry['speed_error']:.3f}")
         value["pitch_offset"].setText(f"{telemetry['pitch_offset']:.3f}")
-        value["turn"].setText(f"{telemetry['turn']:.3f}")
+        differential_speed = telemetry.get("differential_speed")
+        turn_motor_command = telemetry.get("turn_motor_command")
+        applied_turn_motor_command = telemetry.get("applied_turn_motor_command")
+        if differential_speed is None or turn_motor_command is None or applied_turn_motor_command is None:
+            value["turn"].setText(f"目标 {telemetry['turn']:.3f}")
+        else:
+            value["turn"].setText(
+                f"{telemetry['turn']:.3f} / {differential_speed:.3f} m/s，"
+                f"{turn_motor_command:.3f} / {applied_turn_motor_command:.3f}"
+            )
         value["motor"].setText(f"{telemetry['motor_left']:.3f}, {telemetry['motor_right']:.3f}")
         if not self.balance_tuning_loaded:
             # Only the first complete telemetry frame initializes the edit
             # controls. Periodic telemetry is display data, not an authority
             # to overwrite an operator's pending/manual tuning values.
             for key in self.balance_tuning_spins:
-                self.balance_tuning_spins[key].setValue(telemetry[key])
+                if telemetry.get(key) is not None:
+                    self.balance_tuning_spins[key].setValue(telemetry[key])
             self.balance_tuning_loaded = True
             self.btn_apply_balance_loop_tuning.setEnabled(True)
             self.btn_apply_balance_tuning.setEnabled(True)
@@ -1559,6 +1659,10 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setEnabled(drive_enabled)
         self.btn_balance_drive.setEnabled(drive_enabled)
         self.btn_balance_drive_zero.setEnabled(drive_enabled)
+        turn_enabled = drive_enabled and not self.route_active
+        self.spin_balance_turn_speed.setEnabled(turn_enabled)
+        self.btn_balance_turn.setEnabled(turn_enabled)
+        self.btn_balance_turn_zero.setEnabled(turn_enabled)
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
         self._update_balance_packet_age(sequence)
