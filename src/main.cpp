@@ -542,6 +542,27 @@ namespace
     return true;
   }
 
+  float wifiTuningValue(const balance_car::app::WifiTuningCommand &command)
+  {
+    const balance_car::control::BalanceTuning balanceTuning = balanceController.tuning();
+    const balance_car::control::VelocityTuning velocityTuning = velocityController.tuning();
+    if (strcmp(command.domain, "balance") == 0)
+    {
+      if (strcmp(command.parameter, "kp") == 0) return balanceTuning.proportionalGain;
+      if (strcmp(command.parameter, "ki") == 0) return balanceTuning.integralGain;
+      if (strcmp(command.parameter, "kd") == 0) return balanceTuning.derivativeGain;
+      if (strcmp(command.parameter, "trim") == 0) return balanceTuning.targetPitchDegrees;
+      if (strcmp(command.parameter, "max_motor") == 0) return balanceTuning.maximumMotorCommand;
+    }
+    if (strcmp(command.domain, "speed") == 0)
+    {
+      if (strcmp(command.parameter, "kp") == 0) return velocityTuning.proportionalGain;
+      if (strcmp(command.parameter, "ki") == 0) return velocityTuning.integralGain;
+      if (strcmp(command.parameter, "max_pitch") == 0) return velocityTuning.maximumPitchOffsetDegrees;
+    }
+    return 0.0F;
+  }
+
   void processWifiTuning()
   {
     wifiDebugServer.service();
@@ -559,6 +580,16 @@ namespace
         stopMotorOutput();
         Serial.println("[WIFI] MOTOR_OUTPUT=STOPPED");
         wifiDebugServer.sendCommandResult(command.requestSequence, true, "STOPPED");
+      }
+      else if (command.kind == balance_car::app::WifiCommandKind::Reset)
+      {
+        // Match a physical RESET press: stop the current process and restart
+        // the MCU, including all safety/control state and Wi-Fi services.
+        stopMotorOutput();
+        wifiDebugServer.sendCommandResult(command.requestSequence, true, "RESTARTING");
+        Serial.println("[WIFI] RESET=RESTARTING");
+        delay(80);
+        ESP.restart();
       }
       else if (command.kind == balance_car::app::WifiCommandKind::Drive)
       {
@@ -582,8 +613,17 @@ namespace
       else
       {
         const bool accepted = applyWifiTuningCommand(command);
+        char reason[96] = {};
+        if (accepted)
+        {
+          // The ACK is the authoritative transaction result. Echo the exact
+          // post-clamp controller value so the host need not infer success
+          // from an unrelated, potentially delayed telemetry packet.
+          snprintf(reason, sizeof(reason), "APPLIED,%s,%s,%.5f",
+                   command.domain, command.parameter, wifiTuningValue(command));
+        }
         wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
-                                          accepted ? "APPLIED" : "REJECTED");
+                                          accepted ? reason : "REJECTED");
       }
     }
   }

@@ -66,16 +66,17 @@ P,<序号>,speed,kp|ki,<值>
 P,<序号>,speed,max_pitch,<0–15>
 C,<序号>,ARM
 C,<序号>,STOP
+C,<序号>,RESET
 C,<序号>,DRIVE,<0.000–0.250>
 ```
 
-`DRIVE` 仅在 `BALANCING` 状态接受；否则回复 `ERR,NOT_BALANCING`。超出范围回复 `ERR,SPEED_RANGE`，格式或非数值速度回复 `ERR,INVALID_SPEED`。主板以 `A,<序号>,OK|ERR,<原因>` 回复命令；以遥测回读的目标/实际速度为实际生效依据。
+`DRIVE` 仅在 `BALANCING` 状态接受；否则回复 `ERR,NOT_BALANCING`。超出范围回复 `ERR,SPEED_RANGE`，格式或非数值速度回复 `ERR,INVALID_SPEED`。`RESET` 可在任意状态使用，等同按下主板 RESET：主板会回复 `OK,RESTARTING` 后立刻重启，Wi-Fi 连接与控制状态随之重新初始化。主板以 `A,<序号>,OK|ERR,<原因>` 回复命令；以遥测回读的目标/实际速度为实际生效依据。
 
-## 5. 串口日志镜像
+## 5. CSV 调试记录
 
-上位机“主板串口日志镜像”窗口会显示原主程序的行级串口输出，包括 `[SELFTEST]`、`[STATUS]`、`[TUNING]`、`[CMD]`、`[BALANCE]`、`[OFFLINE]`、`[WIFI]` 和每 500 ms 的 `[TELEMETRY]`。USB 串口输出仍保持不变。
+每次连接主板调试后，上位机自动在 `tool/records/`（camera 工程为 `tools/records/`）创建 CSV。其记录完整结构化 IMU 数据：俯仰角、角速度、加速度姿态角、三轴加速度、三轴陀螺仪，以及安全状态、速度、车轮线速度、电机输出和 PID/PI 回读参数。
 
-日志使用 `L,<序号>,<原串口文本>` UDP 包发送，窗口保留最近 500 行。主板缓存上电后的最近 32 行，订阅建立后自动补发；日志仅用于调试，不参与平衡控制。
+CSV 直接来自主板结构化遥测，IMU 数据比文本日志更适合后处理和绘图；无需额外保存 TXT 串口镜像。主板 `L,<序号>,<text>` 日志窗口仍用于现场查看 Wi-Fi 与控制诊断，不参与控制。
 
 ## 6. 排查
 

@@ -13,6 +13,7 @@ enum class WifiCommandKind : uint8_t
   Tuning,
   Arm,
   Stop,
+  Reset,
   Drive,
   Turn,
 };

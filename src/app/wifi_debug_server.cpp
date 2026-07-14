@@ -355,6 +355,15 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       }
       _pendingCommand.kind = WifiCommandKind::Stop;
     }
+    else if (strcmp(action, "reset") == 0)
+    {
+      if (strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::Reset;
+    }
     else if (strcmp(action, "drive") == 0)
     {
       char *speedText = strtok_r(nullptr, ",", &context);

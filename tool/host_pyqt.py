@@ -11,8 +11,6 @@ ESP32-S3 + GC2145 平衡小车上位机（PyQt5）
 - 将 C++ 算法参数（流模式、灰度阈值、ROI）下发给 ESP32，由 ESP32 端执行算法
 - 显示 ESP32 C++ 算法处理后的效果（二值化掩膜 + 赛道中线）
 
-运行：
-    d:\workspace\balance_camera\venv_host\Scripts\python.exe tools/host_pyqt.py
 
 依赖：
     PyQt5, opencv-python, numpy, requests
@@ -430,6 +428,7 @@ class BalanceTelemetryWorker(QThread):
     telemetry_ready = pyqtSignal(dict)
     ack_received = pyqtSignal(str)
     console_line_received = pyqtSignal(str)
+    command_failed = pyqtSignal(int, str)
     info_updated = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
 
@@ -470,11 +469,12 @@ class BalanceTelemetryWorker(QThread):
         """串行下发命令并等待 ACK，避免 UDP 突发包被主板丢弃。"""
         if self._inflight_command is not None:
             elapsed = now - self._inflight_command["sent_at"]
-            if elapsed < 0.35:
+            if elapsed < 0.50:
                 return
-            if self._inflight_command["retries"] >= 2:
+            if self._inflight_command["retries"] >= 3:
                 sequence = self._inflight_command["sequence"]
                 self.error_occurred.emit(f"主板命令超时：序号 {sequence}")
+                self.command_failed.emit(sequence if sequence is not None else -1, "TIMEOUT")
                 self._inflight_command = None
                 return
             try:
@@ -955,7 +955,10 @@ class MainWindow(QMainWindow):
         self.balance_command_sequence = 0
         self.balance_pending_tuning = {}
         self.balance_pending_sequences = {}
+        self.balance_tuning_loaded = False
         self.balance_last_received_monotonic = None
+        self.balance_last_telemetry_sequence = None
+        self.balance_last_board_timestamp_ms = None
         self.balance_rx_hz = 0.0
         self.speed_record_file = None
         self.speed_record_writer = None
@@ -1003,7 +1006,14 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(self.btn_balance_stop, 2, 3, 1, 3)
         connection_grid.addWidget(QLabel("启动仍需通过主板自检、IMU 与姿态角安全校验。"), 2, 6, 1, 2)
 
-        connection_grid.addWidget(QLabel("前进速度给定 (m/s):"), 3, 0)
+        self.btn_balance_reset = QPushButton("重启主板")
+        self.btn_balance_reset.setObjectName("stop")
+        self.btn_balance_reset.setToolTip("等同按下主板 RESET：主板将立即重启，Wi-Fi 连接会暂时断开。")
+        self.btn_balance_reset.clicked.connect(self.request_board_reset)
+        self.btn_balance_reset.setEnabled(False)
+        connection_grid.addWidget(self.btn_balance_reset, 3, 0, 1, 2)
+
+        connection_grid.addWidget(QLabel("前进速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
         self.spin_balance_drive_speed.setRange(0.0, 0.250)
@@ -1011,16 +1021,15 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setValue(0.0)
         self.spin_balance_drive_speed.setEnabled(False)
         self.spin_balance_drive_speed.setToolTip("仅在 BALANCING 状态下可下发；主板会按 0.10 m/s² 斜坡改变给定")
-        connection_grid.addWidget(self.spin_balance_drive_speed, 3, 1)
+        connection_grid.addWidget(self.spin_balance_drive_speed, 3, 3)
         self.btn_balance_drive = QPushButton("设置前进速度")
         self.btn_balance_drive.clicked.connect(self.request_balance_drive_speed)
         self.btn_balance_drive.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_drive, 3, 2, 1, 2)
+        connection_grid.addWidget(self.btn_balance_drive, 3, 4, 1, 2)
         self.btn_balance_drive_zero = QPushButton("回到原地平衡")
         self.btn_balance_drive_zero.clicked.connect(self.request_balance_drive_zero)
         self.btn_balance_drive_zero.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_drive_zero, 3, 4, 1, 2)
-        connection_grid.addWidget(QLabel("仅支持前进速度；停止平衡请使用红色按钮。"), 3, 6, 1, 2)
+        connection_grid.addWidget(self.btn_balance_drive_zero, 3, 6, 1, 2)
 
         connection_grid.addWidget(QLabel("自动路线:"), 4, 0)
         self.cmb_route_direction = QComboBox()
@@ -1054,6 +1063,7 @@ class MainWindow(QMainWindow):
             ("accel_pitch", "加速度姿态角 (°)"),
             ("accel", "加速度 g (X,Y,Z)"), ("gyro", "陀螺仪 °/s (X,Y,Z)"),
             ("speed", "目标 / 实际速度 (m/s)"), ("speed_error", "速度误差 (m/s)"),
+            ("wheel_speed", "左右车轮线速度 (m/s)"),
             ("pitch_offset", "速度环俯角输出 (°)"), ("turn", "转向量"),
             ("motor", "左右电机输出"), ("packet", "包序号 / 包龄 / 频率"),
         ]
@@ -1070,11 +1080,11 @@ class MainWindow(QMainWindow):
         tuning_grid = QGridLayout(tuning_group)
         self.balance_tuning_spins = {}
         tuning_fields = [
-            ("balance_kp", "角度 Kp", 0.15, 5),
+            ("balance_kp", "角度 Kp", 0.12, 5),
             ("balance_ki", "角度 Ki", 0.0, 5),
             ("balance_kd", "角度 Kd", 0.003, 5),
             ("balance_trim", "平衡点 Trim (°)", -2.09, 3),
-            ("speed_kp", "速度 Kp", 3.0, 5),
+            ("speed_kp", "速度 Kp", 11.0, 5),
             ("speed_ki", "速度 Ki", 0.15, 6),
             ("max_motor", "最大电机输出 (0–1)", 0.45, 3),
             ("max_pitch", "最大俯仰偏置 (°)", 6.0, 2),
@@ -1175,16 +1185,22 @@ class MainWindow(QMainWindow):
         )
         self.balance_worker.telemetry_ready.connect(self.on_balance_telemetry)
         self.balance_worker.ack_received.connect(self.on_balance_ack)
+        self.balance_worker.command_failed.connect(self.on_balance_command_failed)
         self.balance_worker.console_line_received.connect(self.on_balance_console_line)
         self.balance_worker.info_updated.connect(self.log)
         self.balance_worker.error_occurred.connect(self.on_error)
         self.balance_worker.start()
         self.balance_age_timer.start()
+        self.balance_last_telemetry_sequence = None
+        self.balance_last_board_timestamp_ms = None
+        self.balance_command_sequence = int(time.time_ns() & 0x7fffffff)
         self.btn_balance_connect.setEnabled(False)
         self.btn_balance_disconnect.setEnabled(True)
-        self.btn_apply_balance_loop_tuning.setEnabled(True)
-        self.btn_apply_balance_tuning.setEnabled(True)
+        self.balance_tuning_loaded = False
+        self.btn_apply_balance_loop_tuning.setEnabled(False)
+        self.btn_apply_balance_tuning.setEnabled(False)
         self.btn_balance_stop.setEnabled(True)
+        self.btn_balance_reset.setEnabled(True)
         self.btn_balance_arm.setEnabled(False)
         self.route_active = False
         self.route_stage = 0
@@ -1209,6 +1225,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "balance_pending_tuning"):
             self.balance_pending_tuning.clear()
             self.balance_pending_sequences.clear()
+        self.balance_tuning_loaded = False
+        self.balance_last_telemetry_sequence = None
+        self.balance_last_board_timestamp_ms = None
         self._stop_speed_recording()
         if hasattr(self, "balance_age_timer"):
             self.balance_age_timer.stop()
@@ -1219,6 +1238,7 @@ class MainWindow(QMainWindow):
             self.btn_apply_balance_tuning.setEnabled(False)
             self.btn_balance_arm.setEnabled(False)
             self.btn_balance_stop.setEnabled(False)
+            self.btn_balance_reset.setEnabled(False)
             self.spin_balance_drive_speed.setEnabled(False)
             self.btn_balance_drive.setEnabled(False)
             self.btn_balance_drive_zero.setEnabled(False)
@@ -1244,7 +1264,9 @@ class MainWindow(QMainWindow):
             self.speed_record_writer.writerow([
                 "timestamp", "board_timestamp_ms", "sequence",
                 "safety_state", "fault_code", "imu_valid",
-                "pitch_deg", "pitch_rate_dps", "requested_pitch_deg",
+                "pitch_deg", "pitch_rate_dps", "accelerometer_pitch_deg",
+                "accel_x_g", "accel_y_g", "accel_z_g",
+                "gyro_x_dps", "gyro_y_dps", "gyro_z_dps", "requested_pitch_deg",
                 "balance_pitch_error_deg", "balance_p_term", "balance_i_term", "balance_d_term",
                 "balance_motor_raw", "left_motor_command", "right_motor_command",
                 "left_wheel_mps", "right_wheel_mps",
@@ -1286,6 +1308,9 @@ class MainWindow(QMainWindow):
                 telemetry["timestamp_ms"], telemetry["sequence"],
                 telemetry["state"], telemetry["fault"], telemetry["imu_valid"],
                 f"{telemetry['pitch']:.6f}", f"{telemetry['pitch_rate']:.6f}",
+                f"{telemetry['accel_pitch']:.6f}",
+                f"{telemetry['accel_x']:.6f}", f"{telemetry['accel_y']:.6f}", f"{telemetry['accel_z']:.6f}",
+                f"{telemetry['gyro_x']:.6f}", f"{telemetry['gyro_y']:.6f}", f"{telemetry['gyro_z']:.6f}",
                 optional_float("requested_pitch"), optional_float("balance_pitch_error"),
                 optional_float("balance_p_term"), optional_float("balance_i_term"),
                 optional_float("balance_d_term"), optional_float("balance_motor_raw"),
@@ -1325,14 +1350,18 @@ class MainWindow(QMainWindow):
         )
 
     def _send_tuning_commands(self, command_fields, success_message: str):
-        if self.balance_worker is None:
-            self.log("请先连接主板 Wi-Fi 调试端口")
+        if self.balance_worker is None or not self.balance_tuning_loaded:
+            self.log("请先连接主板并等待首次参数遥测完成")
             return
+        self.btn_apply_balance_loop_tuning.setEnabled(False)
+        self.btn_apply_balance_tuning.setEnabled(False)
         for domain, parameter, key in command_fields:
             self.balance_command_sequence += 1
             value = self.balance_tuning_spins[key].value()
             self.balance_pending_tuning[key] = value
-            self.balance_pending_sequences[self.balance_command_sequence] = key
+            self.balance_pending_sequences[self.balance_command_sequence] = {
+                "key": key, "domain": domain, "parameter": parameter, "value": value,
+            }
             command = f"P,{self.balance_command_sequence},{domain},{parameter},{value:.7f}\n"
             self.balance_worker.queue_command(command.encode("ascii"))
         self.log(success_message)
@@ -1356,6 +1385,17 @@ class MainWindow(QMainWindow):
             return
         self.cancel_route(send_stop=False)
         self._send_balance_control("STOP")
+
+    def request_board_reset(self):
+        if self.balance_worker is None:
+            return
+        answer = QMessageBox.question(
+            self, "确认重启主板",
+            "这相当于按下主板 RESET：平衡、Wi-Fi 与全部控制状态会立即重启。\n确认继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer == QMessageBox.Yes:
+            self._send_balance_control("RESET")
 
     def start_route(self):
         if self.balance_worker is None:
@@ -1446,6 +1486,27 @@ class MainWindow(QMainWindow):
         self.log(f"已发送主板控制命令：{action}{suffix}")
 
     def on_balance_telemetry(self, telemetry: dict):
+        sequence = telemetry["sequence"]
+        board_timestamp_ms = telemetry["timestamp_ms"]
+        previous_sequence = self.balance_last_telemetry_sequence
+        previous_timestamp_ms = self.balance_last_board_timestamp_ms
+        if previous_sequence is not None and sequence <= previous_sequence:
+            # UDP can deliver a queued, older telemetry frame after a newer
+            # one. Never let that stale frame overwrite confirmed tuning.
+            # A real MCU restart is identified by its millisecond clock
+            # returning near zero after the board had already been running.
+            board_restarted = (
+                previous_timestamp_ms is not None and previous_timestamp_ms > 5000
+                and board_timestamp_ms < 2000
+            )
+            if not board_restarted:
+                return
+            self.log("检测到主板重启，已重新开始接收遥测序号")
+            self.balance_pending_tuning.clear()
+            self.balance_pending_sequences.clear()
+
+        self.balance_last_telemetry_sequence = sequence
+        self.balance_last_board_timestamp_ms = board_timestamp_ms
         self.balance_last_received_monotonic = time.monotonic()
         self._record_speed_telemetry(telemetry)
         if "rx_hz" in telemetry:
@@ -1468,22 +1529,26 @@ class MainWindow(QMainWindow):
             f"{telemetry['gyro_x']:.2f}, {telemetry['gyro_y']:.2f}, {telemetry['gyro_z']:.2f}"
         )
         value["speed"].setText(f"{telemetry['target_speed']:.3f} / {telemetry['filtered_speed']:.3f}")
+        left_wheel = telemetry.get("wheel_left")
+        right_wheel = telemetry.get("wheel_right")
+        value["wheel_speed"].setText(
+            "-" if left_wheel is None else f"{left_wheel:.3f}, {right_wheel:.3f}"
+        )
         value["speed_error"].setText(f"{telemetry['speed_error']:.3f}")
         value["pitch_offset"].setText(f"{telemetry['pitch_offset']:.3f}")
         value["turn"].setText(f"{telemetry['turn']:.3f}")
         value["motor"].setText(f"{telemetry['motor_left']:.3f}, {telemetry['motor_right']:.3f}")
-        for key in self.balance_tuning_spins:
-            pending_value = self.balance_pending_tuning.get(key)
-            if pending_value is not None:
-                if abs(telemetry[key] - pending_value) <= 1e-4:
-                    del self.balance_pending_tuning[key]
-                    for sequence, pending_key in list(self.balance_pending_sequences.items()):
-                        if pending_key == key:
-                            del self.balance_pending_sequences[sequence]
-                else:
-                    continue
-            if not self.balance_tuning_spins[key].hasFocus():
+        if not self.balance_tuning_loaded:
+            # Only the first complete telemetry frame initializes the edit
+            # controls. Periodic telemetry is display data, not an authority
+            # to overwrite an operator's pending/manual tuning values.
+            for key in self.balance_tuning_spins:
                 self.balance_tuning_spins[key].setValue(telemetry[key])
+            self.balance_tuning_loaded = True
+            self.btn_apply_balance_loop_tuning.setEnabled(True)
+            self.btn_apply_balance_tuning.setEnabled(True)
+            self.log("已从主板读取当前 PID / PI 参数；现在可安全下发修改")
+
         self.lbl_balance_link.setText("已收到主板遥测")
         self.lbl_balance_link.setStyleSheet("color: #16803c;")
         self.btn_balance_arm.setEnabled(
@@ -1496,7 +1561,7 @@ class MainWindow(QMainWindow):
         self.btn_balance_drive_zero.setEnabled(drive_enabled)
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
-        self._update_balance_packet_age(telemetry["sequence"])
+        self._update_balance_packet_age(sequence)
 
     def on_balance_ack(self, ack: str):
         self.log(f"主板参数响应：{ack}")
@@ -1507,13 +1572,48 @@ class MainWindow(QMainWindow):
             sequence = int(fields[1])
         except ValueError:
             return
-        key = self.balance_pending_sequences.get(sequence)
-        if key is None:
+        pending = self.balance_pending_sequences.pop(sequence, None)
+        if pending is None:
             return
+        key = pending["key"]
         if fields[2] != "OK":
-            self.balance_pending_sequences.pop(sequence, None)
             self.balance_pending_tuning.pop(key, None)
             self.log(f"[ERROR] 参数 {key} 被主板拒绝：{fields[3]}")
+            self._finish_tuning_transaction()
+            return
+
+        result = fields[3].split(",")
+        if (len(result) != 4 or result[0] != "APPLIED" or
+                result[1] != pending["domain"] or result[2] != pending["parameter"]):
+            self.balance_pending_tuning.pop(key, None)
+            self.log(f"[ERROR] 参数 {key} 的 ACK 格式无效：{fields[3]}")
+            self._finish_tuning_transaction()
+            return
+        try:
+            actual_value = float(result[3])
+        except ValueError:
+            self.balance_pending_tuning.pop(key, None)
+            self.log(f"[ERROR] 参数 {key} 的 ACK 数值无效：{fields[3]}")
+            self._finish_tuning_transaction()
+            return
+
+        self.balance_pending_tuning.pop(key, None)
+        self.balance_tuning_spins[key].setValue(actual_value)
+        self.log(f"参数已由主板 ACK 确认：{key}={actual_value:.5f}")
+        self._finish_tuning_transaction()
+
+    def on_balance_command_failed(self, sequence: int, reason: str):
+        pending = self.balance_pending_sequences.pop(sequence, None)
+        if pending is not None:
+            self.balance_pending_tuning.pop(pending["key"], None)
+            self.log(f"[ERROR] 参数 {pending['key']} 下发超时，输入值已保留：{reason}")
+            self._finish_tuning_transaction()
+
+    def _finish_tuning_transaction(self):
+        if self.balance_worker is None or self.balance_pending_sequences:
+            return
+        self.btn_apply_balance_loop_tuning.setEnabled(self.balance_tuning_loaded)
+        self.btn_apply_balance_tuning.setEnabled(self.balance_tuning_loaded)
 
     def on_balance_console_line(self, line: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
