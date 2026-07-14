@@ -39,6 +39,22 @@ namespace balance_car::config
     float balanceFaultAngleDegrees;
   };
 
+  // Optional protection for a confirmed loss of ground contact. It is disabled
+  // by default so ordinary ground-driving and differential-speed tuning retain
+  // their existing control path and timing.
+  struct AirborneLandingConfiguration
+  {
+    bool enabled;
+    float airborneAccelerationThresholdG;
+    uint16_t airborneConfirmationMs;
+    uint16_t maximumAirborneMs;
+    float landingAccelerationMinimumG;
+    float landingAccelerationMaximumG;
+    uint16_t landingSettleMs;
+    uint16_t landingRecoveryTimeoutMs;
+    uint16_t motorRecoveryRampMs;
+  };
+
   struct AttitudeConfiguration
   {
     enum class PitchAxis
@@ -75,6 +91,27 @@ namespace balance_car::config
     float maximumPitchOffsetDegrees;
     float measurementFilterAlpha;
     bool outputInverted;
+  };
+
+  // Controls the wheel-speed difference used for steering. A positive target
+  // means that the right wheel should move faster than the left wheel.
+  struct DifferentialSpeedConfiguration
+  {
+    float proportionalGain;
+    float integralGain;
+    float integralLimit;
+    float maximumTurnMotorCommand;
+    float measurementFilterAlpha;
+    bool outputInverted;
+  };
+
+  // Differential-drive odometry uses the distance between the centers of the
+  // two tire contact patches. Measure this on the assembled vehicle before
+  // relying on its heading for path measurement.
+  struct OdometryConfiguration
+  {
+    float wheelTrackMeters;
+    float yawRateFilterAlpha;
   };
 
   struct MotionConfiguration
@@ -120,6 +157,20 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .balanceFaultAngleDegrees = 60.0F,
   };
 
+  constexpr AirborneLandingConfiguration kAirborneLandingConfiguration = {
+      // Enable only after suspended and small-height landing tests have
+      // validated the vehicle's mechanical strength and IMU thresholds.
+      .enabled = false,
+      .airborneAccelerationThresholdG = 0.35F,
+      .airborneConfirmationMs = 20,
+      .maximumAirborneMs = 500,
+      .landingAccelerationMinimumG = 0.75F,
+      .landingAccelerationMaximumG = 1.25F,
+      .landingSettleMs = 60,
+      .landingRecoveryTimeoutMs = 700,
+      .motorRecoveryRampMs = 250,
+  };
+
   constexpr AttitudeConfiguration kAttitudeConfiguration = {
       .pitchAxis = AttitudeConfiguration::PitchAxis::Y,
       .complementaryFilterTimeConstantSeconds = 0.25F,
@@ -154,10 +205,30 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .outputInverted = false,
   };
 
+  constexpr DifferentialSpeedConfiguration kDifferentialSpeedConfiguration = {
+      // At zero measured differential speed this retains the former
+      // turn-command-to-motor-command scale, while encoder feedback removes
+      // left/right motor and surface mismatch.
+      .proportionalGain = 1.0F,
+      .integralGain = 0.0F,
+      .integralLimit = 0.30F,
+      .maximumTurnMotorCommand = 0.20F,
+      .measurementFilterAlpha = 0.30F,
+      .outputInverted = false,
+  };
+
+  constexpr OdometryConfiguration kOdometryConfiguration = {
+      // Initial measured estimate; calibrate with a slow, known-angle turn.
+      .wheelTrackMeters = 0.200F,
+      // Suppresses encoder-quantization noise while retaining turn response.
+      .yawRateFilterAlpha = 0.35F,
+  };
+
   constexpr MotionConfiguration kMotionConfiguration = {
       .maximumTargetSpeedMps = 0.25F,
       .initialTargetSpeedMps = 0.06F,
       .targetSpeedStepMps = 0.05F,
+      // Target right-minus-left wheel speed for differential steering, in m/s.
       .maximumTurnCommand = 0.20F,
       .turnCommandStep = 0.03F,
   };

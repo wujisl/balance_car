@@ -46,7 +46,12 @@ struct WifiTelemetry
   float filteredSpeedMps = 0.0F;
   float speedErrorMps = 0.0F;
   float speedPitchOffsetDegrees = 0.0F;
+  // Target right-minus-left wheel speed, in m/s.
   float turnCommand = 0.0F;
+  float filteredDifferentialSpeedMps = 0.0F;
+  float differentialSpeedErrorMps = 0.0F;
+  float turnMotorCommand = 0.0F;
+  float appliedTurnMotorCommand = 0.0F;
   float leftMotorCommand = 0.0F;
   float rightMotorCommand = 0.0F;
   float leftWheelSpeedMps = 0.0F;
@@ -64,8 +69,14 @@ struct WifiTelemetry
   float speedKp = 0.0F;
   float speedKi = 0.0F;
   bool speedInverted = false;
+  float turnKp = 0.0F;
+  float turnKi = 0.0F;
+  float maximumTurnMotorCommand = 0.0F;
+  bool turnInverted = false;
   float maximumMotorCommand = 0.0F;
   float maximumPitchOffsetDegrees = 0.0F;
+  float headingDegrees = 0.0F;
+  float yawRateDegreesPerSecond = 0.0F;
 };
 
 // Wi-Fi transport only: it has no knowledge of motors, arming, or control laws.

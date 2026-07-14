@@ -47,7 +47,8 @@ bool SafetyManager::requestBalance(float pitchDegrees, bool attitudeValid, bool 
   return true;
 }
 
-void SafetyManager::monitorBalance(float pitchDegrees, bool attitudeValid, bool imuHealthy)
+void SafetyManager::monitorBalance(float pitchDegrees, bool attitudeValid, bool imuHealthy,
+                                   bool enforcePitchLimit)
 {
   if (_state != SafetyState::Balancing)
   {
@@ -60,7 +61,7 @@ void SafetyManager::monitorBalance(float pitchDegrees, bool attitudeValid, bool 
     return;
   }
 
-  if (fabsf(pitchDegrees) >= _configuration.balanceFaultAngleDegrees)
+  if (enforcePitchLimit && fabsf(pitchDegrees) >= _configuration.balanceFaultAngleDegrees)
   {
     reportFault(FaultCode::PitchLimitExceeded);
   }
@@ -153,6 +154,8 @@ const char *SafetyManager::faultName(FaultCode faultCode)
     return "IMU_UNHEALTHY";
   case FaultCode::PitchLimitExceeded:
     return "PITCH_LIMIT_EXCEEDED";
+  case FaultCode::AirborneLandingFailed:
+    return "AIRBORNE_LANDING_FAILED";
   }
   return "UNKNOWN";
 }
