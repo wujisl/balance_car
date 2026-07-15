@@ -25,7 +25,12 @@ bool isAllowedParameter(const char *domain, const char *parameter)
             strcmp(parameter, "max_pitch") == 0)) ||
           (strcmp(domain, "turn") == 0 &&
            (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
-            strcmp(parameter, "max") == 0));
+            strcmp(parameter, "max") == 0)) ||
+          (strcmp(domain, "vision") == 0 &&
+           (strcmp(parameter, "period_ms") == 0 || strcmp(parameter, "filter") == 0 ||
+            strcmp(parameter, "max_step_mmps") == 0 ||
+            strcmp(parameter, "curve_hold") == 0 ||
+            strcmp(parameter, "curve_hold_mmps") == 0));
 }
 
 void toLowercase(char *text)
@@ -73,8 +78,6 @@ void WifiDebugServer::begin()
            _configuration.telemetryPort, _configuration.commandPort);
   writeConsoleBytes(reinterpret_cast<const uint8_t *>(startupLine), strlen(startupLine));
   writeConsoleByte('\n');
-  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"),
-                    strlen("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"));
   writeConsoleByte('\n');
 }
 
@@ -171,7 +174,7 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,5,%lu,%lu,%u,%u,%u,"
+      "T,9,%lu,%lu,%u,%u,%u,"
       "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
       "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
       "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
@@ -189,7 +192,8 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       "%.5f,%.5f,%.5f,"         // balance P/I/D terms
       "%.5f,%u,"               // raw balance motor command, speed output inverted
       "%.5f,%.5f,%.3f,%u,"    // turn Kp/Ki/max command, output inverted
-      "%.3f,%.3f\n",          // relative heading, filtered yaw rate
+      "%.3f,%.3f,"             // relative heading, filtered yaw rate
+      "%u,%u,%u,%.3f,%u,%u,%u\n", // vision enabled, fresh sample, accepted, camera delta-v, update period/filter/max-step
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -213,7 +217,14 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.balanceMotorRaw, telemetry.speedInverted ? 1U : 0U,
       telemetry.turnKp, telemetry.turnKi, telemetry.maximumTurnMotorCommand,
       telemetry.turnInverted ? 1U : 0U,
-      telemetry.headingDegrees, telemetry.yawRateDegreesPerSecond);
+      telemetry.headingDegrees, telemetry.yawRateDegreesPerSecond,
+      telemetry.visionTrackingEnabled ? 1U : 0U,
+      telemetry.visionSampleFresh ? 1U : 0U,
+      telemetry.visionCommandAccepted ? 1U : 0U,
+      telemetry.visionDeltaSpeedMps,
+      static_cast<unsigned int>(telemetry.visionTargetUpdatePeriodMs),
+      telemetry.visionTargetFilterEnabled ? 1U : 0U,
+      static_cast<unsigned int>(telemetry.visionTargetMaximumStepMmps));
   if (length <= 0 || length >= static_cast<int>(sizeof(packet)))
   {
     return;
@@ -253,13 +264,6 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
     Serial.print(_telemetryPort != 0 ? 1 : 0);
     Serial.print(" STATIONS=");
     Serial.println(WiFi.softAPgetStationNum());
-    char logLine[kConsoleLineCapacity] = {};
-    snprintf(logLine, sizeof(logLine), "[WIFI] TX ok=%u fail=%u seq=%lu bytes=%d target=%u.%u.%u.%u:%u send=%s sub=%u sta=%u",
-             _telemetryPacketsSinceDiagnostics, _telemetryFailuresSinceDiagnostics,
-             static_cast<unsigned long>(_telemetrySequence - 1), length,
-             targetIp[0], targetIp[1], targetIp[2], targetIp[3], targetPort,
-             sent ? "OK" : "FAILED", _telemetryPort != 0 ? 1U : 0U, WiFi.softAPgetStationNum());
-    sendConsoleLine(logLine);
     _telemetryPacketsSinceDiagnostics = 0;
     _telemetryFailuresSinceDiagnostics = 0;
   }
@@ -299,22 +303,12 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       Serial.print(_telemetryIp);
       Serial.print(':');
       Serial.println(_telemetryPort);
-      char logLine[kConsoleLineCapacity] = {};
-      snprintf(logLine, sizeof(logLine), "[WIFI] TELEMETRY_SUBSCRIBER=%u.%u.%u.%u:%u",
-               _telemetryIp[0], _telemetryIp[1], _telemetryIp[2], _telemetryIp[3], _telemetryPort);
-      sendConsoleLine(logLine);
       sendConsoleHistory();
     }
     const uint32_t nowMs = millis();
     if (changed || nowMs - _lastSubscriptionDiagnosticsMs >= 2000)
     {
       _lastSubscriptionDiagnosticsMs = nowMs;
-      char logLine[kConsoleLineCapacity] = {};
-      snprintf(logLine, sizeof(logLine), "[WIFI] H rx=%lu from=%u.%u.%u.%u:%u changed=%u stations=%u",
-               static_cast<unsigned long>(_subscriptionCount), _replyIp[0], _replyIp[1], _replyIp[2], _replyIp[3],
-               _replyPort, changed ? 1U : 0U, WiFi.softAPgetStationNum());
-      Serial.println(logLine);
-      sendConsoleLine(logLine);
     }
     return false;
   }
@@ -413,6 +407,18 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       _pendingCommand.kind = WifiCommandKind::Turn;
       _pendingCommand.value = turn;
     }
+    else if (strcmp(action, "track") == 0)
+    {
+      char *enabledText = strtok_r(nullptr, ",", &context);
+      if (enabledText == nullptr || strtok_r(nullptr, ",", &context) != nullptr ||
+          (strcmp(enabledText, "0") != 0 && strcmp(enabledText, "1") != 0))
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "TRACK_VALUE");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::Track;
+      _pendingCommand.value = strcmp(enabledText, "1") == 0 ? 1.0F : 0.0F;
+    }
     else
     {
       sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_ACTION");
@@ -460,6 +466,15 @@ void WifiDebugServer::finishConsoleLine()
     return;
   }
   _consoleLine[_consoleLineLength] = '\0';
+  // The host's serial-mirror pane is reserved for compact tracking I2C
+  // diagnostics.  IMU and Wi-Fi diagnostics continue on hardware Serial;
+  // IMU data itself remains available through normal UDP telemetry/CSV.
+  if (strncmp(_consoleLine, "[I2C]", 5) != 0)
+  {
+    _consoleLineLength = 0;
+    _consoleLine[0] = '\0';
+    return;
+  }
   strncpy(_consoleHistory[_consoleHistoryNext], _consoleLine, kConsoleLineCapacity - 1);
   _consoleHistory[_consoleHistoryNext][kConsoleLineCapacity - 1] = '\0';
   _consoleHistoryNext = static_cast<uint8_t>((_consoleHistoryNext + 1) % kConsoleHistoryDepth);

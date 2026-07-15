@@ -29,13 +29,18 @@ from urllib.parse import urljoin
 import cv2
 import numpy as np
 import requests
+from calibration.calibration_core import (
+    find_corners, load_intrinsic_result, render_checkerboard, save_intrinsic_result,
+    load_track_alignment, save_flat_validation, save_track_alignment,
+    solve_intrinsics, solve_manual_flat_plane, write_cpp_header, TrackAlignment,
+)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox, QTabWidget,
-    QTextEdit, QGroupBox, QGridLayout, QFileDialog, QMessageBox,
-    QSplitter, QComboBox, QCheckBox
+    QTextEdit, QGroupBox, QGridLayout, QFileDialog, QMessageBox, QDialog,
+    QSplitter, QComboBox, QCheckBox, QScrollArea
 )
 
 
@@ -55,7 +60,8 @@ def encode_udp_command(quality: int = None, interval_ms: int = None, stream_divi
                         otsu_alpha: int = None, foreground_range: tuple = None,
                         edge_threshold: int = None, smooth_filter: bool = None,
                         morph_clean: bool = None, smooth_alpha: int = None,
-                        max_row_gap: int = None, max_hold_frames: int = None) -> bytes:
+                        max_row_gap: int = None, max_hold_frames: int = None,
+                        tracking_tuning: tuple = None) -> bytes:
     """生成发送给 ESP32 的 ASCII 命令。"""
     if quality is not None:
         return f"Q={quality}\n".encode("ascii")
@@ -97,6 +103,9 @@ def encode_udp_command(quality: int = None, interval_ms: int = None, stream_divi
         return f"D={max_row_gap}\n".encode("ascii")
     if max_hold_frames is not None:
         return f"H={max_hold_frames}\n".encode("ascii")
+    if tracking_tuning is not None:
+        return (f"K={tracking_tuning[0]},{tracking_tuning[1]},"
+                f"{tracking_tuning[2]},{tracking_tuning[3]}\n").encode("ascii")
     return b""
 
 
@@ -249,8 +258,6 @@ class SingleFrameWorker(QThread):
 # 后台工作线程：UDP 裸二进制 JPEG 流
 # ---------------------------------------------------------------------------
 class UdpStreamWorker(QThread):
-    frame_ready = pyqtSignal(np.ndarray)
-    latest_frame_available = pyqtSignal()
     fps_updated = pyqtSignal(float)
     info_updated = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
@@ -263,28 +270,22 @@ class UdpStreamWorker(QThread):
         self.esp_ip = esp_ip
         self.cmd_port = cmd_port
         self.running = False
+        self._stop_event = threading.Event()
         self.cmd_socket = None
+        self._receive_socket = None
         self._frame_lock = threading.Lock()
         self._latest_frame = None
-        self._frame_notification_pending = False
         self._init_cmd_socket()
 
     def _publish_latest_frame(self, img: np.ndarray):
         """只保留最新解码帧，避免 GUI 事件队列积压造成显示延迟。"""
-        notify = False
         with self._frame_lock:
             self._latest_frame = img
-            if not self._frame_notification_pending:
-                self._frame_notification_pending = True
-                notify = True
-        if notify:
-            self.latest_frame_available.emit()
 
     def take_latest_frame(self):
         with self._frame_lock:
             img = self._latest_frame
             self._latest_frame = None
-            self._frame_notification_pending = False
             return img
 
     def _init_cmd_socket(self):
@@ -303,7 +304,13 @@ class UdpStreamWorker(QThread):
 
     def stop(self):
         self.running = False
-        self.wait(1000)
+        self._stop_event.set()
+        if self._receive_socket is not None:
+            try:
+                self._receive_socket.close()
+            except OSError:
+                pass
+        self.wait(1500)
         if self.cmd_socket is not None:
             try:
                 self.cmd_socket.close()
@@ -313,13 +320,13 @@ class UdpStreamWorker(QThread):
 
     def run(self):
         self.running = True
-        self._init_cmd_socket()
 
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
             sock.bind(("0.0.0.0", self.local_port))
-            sock.settimeout(0.2)
+            sock.settimeout(0.05)
+            self._receive_socket = sock
         except Exception as e:
             self.error_occurred.emit(f"UDP bind failed: {e}")
             return
@@ -330,18 +337,22 @@ class UdpStreamWorker(QThread):
         expected_cnt = None
         packets = {}
         first_seen = 0.0
+        last_completed_fid = None
         decoded_frames = 0
         dropped_frames = 0
-        last_stats_time = time.time()
+        malformed_packets = 0
+        last_stats_time = time.monotonic()
+        last_fps_time = last_stats_time
+        fps_frames = 0
         last_frame_info_time = 0.0
 
-        while self.running:
+        while self.running and not self._stop_event.is_set():
             try:
-                data, _ = sock.recvfrom(2048)
+                data, _ = sock.recvfrom(65535)
             except socket.timeout:
                 # 检查当前帧是否超时未收齐
                 if current_fid is not None and len(packets) < expected_cnt:
-                    if time.time() - first_seen > 0.15:
+                    if time.monotonic() - first_seen > 0.075:
                         dropped_frames += 1
                         current_fid = None
                         expected_cnt = None
@@ -358,7 +369,8 @@ class UdpStreamWorker(QThread):
             )
             if magic != UDP_MAGIC:
                 continue
-            if pcnt == 0:
+            if pcnt == 0 or pid >= pcnt or plen > len(data) - UDP_HEADER_LEN:
+                malformed_packets += 1
                 continue
 
             payload = data[UDP_HEADER_LEN:UDP_HEADER_LEN + plen]
@@ -367,18 +379,31 @@ class UdpStreamWorker(QThread):
 
             # 新帧号到达，丢弃旧帧
             if fid != current_fid:
-                if current_fid is not None and len(packets) < expected_cnt:
-                    dropped_frames += 1
+                if last_completed_fid is not None:
+                    delta_from_completed = (fid - last_completed_fid) & 0xFFFFFFFF
+                    if delta_from_completed == 0 or delta_from_completed >= 0x80000000:
+                        continue
+                if current_fid is not None:
+                    # Newer frame IDs are accepted; delayed old frames never
+                    # replace the frame that is currently being assembled.
+                    if ((fid - current_fid) & 0xFFFFFFFF) >= 0x80000000:
+                        continue
+                    if len(packets) < expected_cnt:
+                        dropped_frames += 1
                 current_fid = fid
                 expected_cnt = pcnt
                 packets = {pid: payload}
-                first_seen = time.time()
+                first_seen = time.monotonic()
             else:
+                if pcnt != expected_cnt:
+                    malformed_packets += 1
+                    continue
                 packets[pid] = payload
 
             # 收齐一包
-            if len(packets) == expected_cnt:
+            if len(packets) == expected_cnt and all(index in packets for index in range(expected_cnt)):
                 jpeg = b"".join(packets[i] for i in range(expected_cnt))
+                completed_fid = current_fid
                 current_fid = None
                 expected_cnt = None
                 packets.clear()
@@ -386,6 +411,8 @@ class UdpStreamWorker(QThread):
                 img = self._decode_jpeg(jpeg)
                 if img is not None:
                     decoded_frames += 1
+                    fps_frames += 1
+                    last_completed_fid = completed_fid
                     self._publish_latest_frame(img)
                     now = time.time()
                     if now - last_frame_info_time >= 1.0:
@@ -396,12 +423,16 @@ class UdpStreamWorker(QThread):
                         last_frame_info_time = now
 
             # 每秒刷新一次统计
-            now = time.time()
+            now = time.monotonic()
             if now - last_stats_time >= 1.0:
                 total = decoded_frames + dropped_frames
                 loss = (dropped_frames / total * 100.0) if total > 0 else 0.0
+                elapsed = now - last_fps_time
+                self.fps_updated.emit(fps_frames / elapsed if elapsed > 0 else 0.0)
+                fps_frames = 0
+                last_fps_time = now
                 self.stats_updated.emit(
-                    f"decoded={decoded_frames} dropped={dropped_frames} loss={loss:.1f}%"
+                    f"decoded={decoded_frames} dropped={dropped_frames} bad={malformed_packets} loss={loss:.1f}%"
                 )
                 # 不重置计数，保持累计
                 last_stats_time = now
@@ -410,6 +441,7 @@ class UdpStreamWorker(QThread):
             sock.close()
         except Exception:
             pass
+        self._receive_socket = None
         self.info_updated.emit("UDP worker stopped")
 
     @staticmethod
@@ -594,61 +626,56 @@ class BalanceTelemetryWorker(QThread):
     @staticmethod
     def _parse_telemetry(text: str):
         parts = text.split(",")
-        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "4"], ["T", "5"]):
+        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "5"], ["T", "6"], ["T", "7"], ["T", "8"], ["T", "9"]):
             return None
-        expected_fields = {"1": 31, "2": 33, "3": 40, "4": 48, "5": 50}[parts[1]]
+        expected_fields = {"1": 31, "2": 33, "3": 40, "5": 50, "6": 53, "7": 54, "8": 55, "9": 57}[parts[1]]
         if len(parts) != expected_fields:
             return None
         try:
             values = [float(value) for value in parts[7:]]
-            if parts[1] in ("4", "5"):
-                return {
-                    "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
-                    "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
-                    "pitch": values[0], "pitch_rate": values[1], "accel_pitch": values[2],
-                    "accel_x": values[3], "accel_y": values[4], "accel_z": values[5],
-                    "gyro_x": values[6], "gyro_y": values[7], "gyro_z": values[8],
-                    "target_speed": values[9], "filtered_speed": values[10], "speed_error": values[11],
-                    "pitch_offset": values[12], "turn": values[13],
-                    "differential_speed": values[14], "differential_speed_error": values[15],
-                    "turn_motor_command": values[16], "applied_turn_motor_command": values[17],
-                    "motor_left": values[18], "motor_right": values[19],
-                    "balance_kp": values[20], "balance_ki": values[21], "balance_kd": values[22],
-                    "balance_trim": values[23], "speed_kp": values[24], "speed_ki": values[25],
-                    "max_motor": values[26], "max_pitch": values[27],
-                    "wheel_left": values[28], "wheel_right": values[29],
-                    "requested_pitch": values[30], "balance_pitch_error": values[31],
-                    "balance_p_term": values[32], "balance_i_term": values[33],
-                    "balance_d_term": values[34], "balance_motor_raw": values[35],
-                    "speed_invert": int(values[36]), "turn_kp": values[37], "turn_ki": values[38],
-                    "max_turn": values[39], "turn_invert": int(values[40]),
-                    "heading": values[41] if parts[1] == "5" else None,
-                    "yaw_rate": values[42] if parts[1] == "5" else None,
-                }
+            # T,7 retains the extended v5/v6 fields and appends the vision
+            # hand-off status.  Treating it as the old compact layout makes
+            # the UI display the target only and hides the real turn feedback.
+            rich = parts[1] in ("5", "6", "7", "8", "9")
             return {
+                "telemetry_version": int(parts[1]),
                 "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
                 "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
                 "pitch": values[0], "pitch_rate": values[1], "accel_pitch": values[2],
                 "accel_x": values[3], "accel_y": values[4], "accel_z": values[5],
                 "gyro_x": values[6], "gyro_y": values[7], "gyro_z": values[8],
                 "target_speed": values[9], "filtered_speed": values[10], "speed_error": values[11],
-                "pitch_offset": values[12], "turn": values[13],
-                "motor_left": values[14], "motor_right": values[15],
-                "balance_kp": values[16], "balance_ki": values[17], "balance_kd": values[18],
-                "balance_trim": values[19], "speed_kp": values[20], "speed_ki": values[21],
-                "max_motor": values[22], "max_pitch": values[23],
-                "wheel_left": values[24] if parts[1] in ("2", "3") else None,
-                "wheel_right": values[25] if parts[1] in ("2", "3") else None,
-                "requested_pitch": values[26] if parts[1] == "3" else None,
-                "balance_pitch_error": values[27] if parts[1] == "3" else None,
-                "balance_p_term": values[28] if parts[1] == "3" else None,
-                "balance_i_term": values[29] if parts[1] == "3" else None,
-                "balance_d_term": values[30] if parts[1] == "3" else None,
-                "balance_motor_raw": values[31] if parts[1] == "3" else None,
-                "speed_invert": int(values[32]) if parts[1] == "3" else None,
-                "differential_speed": None, "differential_speed_error": None,
-                "turn_motor_command": None, "applied_turn_motor_command": None,
-                "turn_kp": None, "turn_ki": None, "max_turn": None, "turn_invert": None,
+                "pitch_offset": values[12],
+                "turn": values[13],
+                "motor_left": values[18] if rich else values[14],
+                "motor_right": values[19] if rich else values[15],
+                "balance_kp": values[20] if rich else values[16], "balance_ki": values[21] if rich else values[17],
+                "balance_kd": values[22] if rich else values[18], "balance_trim": values[23] if rich else values[19],
+                "speed_kp": values[24] if rich else values[20], "speed_ki": values[25] if rich else values[21],
+                "max_motor": values[26] if rich else values[22], "max_pitch": values[27] if rich else values[23],
+                "wheel_left": values[28] if rich else (values[24] if parts[1] in ("2", "3") else None),
+                "wheel_right": values[29] if rich else (values[25] if parts[1] in ("2", "3") else None),
+                "requested_pitch": values[30] if rich else (values[26] if parts[1] == "3" else None),
+                "balance_pitch_error": values[31] if rich else (values[27] if parts[1] == "3" else None),
+                "balance_p_term": values[32] if rich else (values[28] if parts[1] == "3" else None),
+                "balance_i_term": values[33] if rich else (values[29] if parts[1] == "3" else None),
+                "balance_d_term": values[34] if rich else (values[30] if parts[1] == "3" else None),
+                "balance_motor_raw": values[35] if rich else (values[31] if parts[1] == "3" else None),
+                "speed_invert": int(values[36]) if rich else (int(values[32]) if parts[1] == "3" else None),
+                "diff_speed": values[14] if rich else None,
+                "diff_error": values[15] if rich else None,
+                "turn_motor": values[16] if rich else None,
+                "turn_applied": values[17] if rich else None,
+                "turn_kp": values[37] if rich else None,
+                "turn_ki": values[38] if rich else None,
+                "turn_max": values[39] if rich else None,
+                "vision_tracking": bool(int(values[43])) if parts[1] in ("6", "7", "8", "9") else None,
+                "vision_fresh": bool(int(values[44])) if parts[1] in ("6", "7", "8", "9") else None,
+                "vision_accepted": bool(int(values[45])) if parts[1] in ("7", "8", "9") else None,
+                "vision_dv": values[46] if parts[1] in ("7", "8", "9") else (values[45] if parts[1] == "6" else None),
+                "vision_period": values[47] if parts[1] in ("8", "9") else None,
+                "vision_filter": bool(int(values[48])) if parts[1] == "9" else None,
+                "vision_max_step": values[49] if parts[1] == "9" else None,
             }
         except ValueError:
             return None
@@ -657,6 +684,120 @@ class BalanceTelemetryWorker(QThread):
 # ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
+class CalibrationImageLabel(QLabel):
+    """Aspect-ratio-safe image widget that returns clicks in source pixels."""
+    image_clicked = pyqtSignal(float, float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source_size = None
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(480, 300)
+        self.setStyleSheet("background:#111; border:1px solid #888;")
+
+    def set_source_size(self, width: int, height: int):
+        self._source_size = (width, height)
+
+    def mousePressEvent(self, event):
+        if self._source_size is None:
+            return
+        source_w, source_h = self._source_size
+        scale = min(self.width() / source_w, self.height() / source_h)
+        shown_w, shown_h = source_w * scale, source_h * scale
+        left, top = (self.width() - shown_w) * 0.5, (self.height() - shown_h) * 0.5
+        x, y = event.pos().x(), event.pos().y()
+        if left <= x <= left + shown_w and top <= y <= top + shown_h:
+            self.image_clicked.emit((x - left) / scale, (y - top) / scale)
+
+
+class VisionI2cDebugDialog(QDialog):
+    """Dedicated view for the board's mirrored [I2C] diagnostics."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("循迹 I2C 状态")
+        self.resize(760, 430)
+        layout = QVBoxLayout(self)
+        self.summary = QLabel("等待主板 [I2C] 状态；新版固件每 0.1 s 更新。")
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.document().setMaximumBlockCount(300)
+        layout.addWidget(self.log_view)
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_path = None
+        self._start_csv_log()
+        clear_button = QPushButton("清空")
+        clear_button.clicked.connect(self.log_view.clear)
+        layout.addWidget(clear_button)
+
+    def append_line(self, line: str):
+        timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        self.log_view.append(f"[{timestamp}] {line}")
+        self._write_csv_log(timestamp, line)
+        self.summary.setText(
+            "dv=相机原始目标，conditioned_dv=限频滤波缓存，cmd_dv=当前真正写入差速环的目标，"
+            "measured_dv=编码器实测右轮减左轮；单位均为 mm/s。"
+        )
+
+    def _start_csv_log(self):
+        try:
+            log_dir = Path(__file__).resolve().parent / "log"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            self._csv_path = log_dir / f"vision_i2c_{stamp}.csv"
+            self._csv_file = self._csv_path.open("w", encoding="utf-8-sig", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow([
+                "timestamp", "track_valid", "camera_delta_speed_mps",
+                "applied_delta_speed_mps", "left_wheel_speed_mps",
+                "right_wheel_speed_mps", "measured_delta_speed_mps",
+                "vehicle_speed_mps", "target_speed_mps",
+            ])
+            self._csv_file.flush()
+        except OSError:
+            self._csv_file = self._csv_writer = self._csv_path = None
+
+    def _write_csv_log(self, timestamp: str, line: str):
+        if self._csv_writer is None or self._csv_file is None:
+            return
+        fields = {}
+        for token in line.replace("[", "").replace("]", "").split():
+            if "=" in token:
+                key, value = token.split("=", 1)
+                fields[key] = value
+        try:
+            def mmps_to_mps(name: str):
+                try:
+                    return f"{float(fields[name]) / 1000.0:.6f}"
+                except (KeyError, ValueError):
+                    return ""
+
+            self._csv_writer.writerow([
+                timestamp,
+                fields.get("valid", ""),
+                mmps_to_mps("dv"),
+                mmps_to_mps("cmd_dv"),
+                fields.get("vl", ""),
+                fields.get("vr", ""),
+                mmps_to_mps("measured_dv"),
+                fields.get("vavg", ""),
+                fields.get("vtarget", ""),
+            ])
+            self._csv_file.flush()
+        except OSError:
+            pass
+
+    def closeEvent(self, event):
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = self._csv_writer = None
+        if self.parent() is not None and hasattr(self.parent(), "vision_i2c_debug_dialog"):
+            self.parent().vision_i2c_debug_dialog = None
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -665,6 +806,17 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self.last_frame = None
+        self._pending_display_frame = None
+        self._stream_generation = 0
+        self._display_timer = QTimer(self)
+        self._display_timer.setInterval(33)  # Render at most 30 Hz; never queue stale frames.
+        self._display_timer.timeout.connect(self._render_latest_display_frame)
+        self.intrinsic_samples = []
+        self.intrinsic_result = None
+        self.track_alignment = None
+        self.calibration_frozen_frame = None
+        self.calibration_points = []
+        self.calibration_mode = "line"
 
         self._build_ui()
         self._apply_styles()
@@ -770,6 +922,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.proc_tab, "算法处理")
 
         self._build_balance_debug_tab()
+        self._build_calibration_tab()
         body_splitter.addWidget(self.tabs)
 
         # 参数面板
@@ -790,14 +943,14 @@ class MainWindow(QMainWindow):
         tx_grid.addWidget(QLabel("发送间隔 ms:"), 0, 2)
         self.spin_interval = QSpinBox()
         self.spin_interval.setRange(0, 1000)
-        self.spin_interval.setValue(5)
+        self.spin_interval.setValue(0)
         self.spin_interval.setToolTip("每帧编码后让出 CPU 的时间，0~20 即可")
         tx_grid.addWidget(self.spin_interval, 0, 3)
 
         tx_grid.addWidget(QLabel("图传间隔帧:"), 1, 0)
         self.spin_stream_divider = QSpinBox()
         self.spin_stream_divider.setRange(0, 30)
-        self.spin_stream_divider.setValue(2)
+        self.spin_stream_divider.setValue(1)
         self.spin_stream_divider.setToolTip("0=关闭调试图传；1=每个视觉帧回传；2=每两帧回传一次")
         tx_grid.addWidget(self.spin_stream_divider, 1, 1)
 
@@ -911,7 +1064,7 @@ class MainWindow(QMainWindow):
         roi_grid.addWidget(QLabel("断行 / 保持帧:"), 6, 2)
         self.spin_row_gap = QSpinBox()
         self.spin_row_gap.setRange(0, 30)
-        self.spin_row_gap.setValue(4)
+        self.spin_row_gap.setValue(8)
         roi_grid.addWidget(self.spin_row_gap, 6, 3)
         roi_grid.addWidget(QLabel("保持帧数:"), 7, 2)
         self.spin_hold_frames = QSpinBox()
@@ -924,13 +1077,13 @@ class MainWindow(QMainWindow):
         self.spin_lookahead_y = QSpinBox()
         self.spin_lookahead_y.setRange(0, 480)
         self.spin_lookahead_y.setValue(112)
-        self.spin_lookahead_y.setToolTip("23 cm~1.1 m 视距下的初始值；应按实测距离标定")
+        self.spin_lookahead_y.setToolTip("优先前瞻行；弯道到不了该行时会自动退到最远可靠可见点")
         roi_grid.addWidget(self.spin_lookahead_y, 8, 1)
 
         roi_grid.addWidget(QLabel("ROI 上边界:"), 9, 0)
         self.spin_roi_y1 = QSpinBox()
         self.spin_roi_y1.setRange(0, 480)
-        self.spin_roi_y1.setValue(60)
+        self.spin_roi_y1.setValue(4)
         roi_grid.addWidget(self.spin_roi_y1, 9, 1)
 
         roi_grid.addWidget(QLabel("ROI 下边界:"), 9, 2)
@@ -943,7 +1096,7 @@ class MainWindow(QMainWindow):
         self.spin_min_width = QSpinBox()
         self.spin_min_width.setRange(0, 320)
         self.spin_min_width.setValue(2)
-        self.spin_min_width.setToolTip("最远 1.1m 黑线预计约 3~5 像素，保留 2 像素下限")
+        self.spin_min_width.setToolTip("短视野远端仍保留 2 像素下限，避免漏掉弯道边缘黑线")
         roi_grid.addWidget(self.spin_min_width, 10, 1)
 
         roi_grid.addWidget(QLabel("最大线宽:"), 10, 2)
@@ -953,12 +1106,38 @@ class MainWindow(QMainWindow):
         self.spin_max_width.setToolTip("过滤纸外阴影等大片黑区；若近端黑线被截断再增大")
         roi_grid.addWidget(self.spin_max_width, 10, 3)
 
+        roi_grid.addWidget(QLabel("循迹横向增益 K_e x100:"), 11, 0)
+        self.spin_track_lateral_gain = QSpinBox()
+        self.spin_track_lateral_gain.setRange(0, 400)
+        self.spin_track_lateral_gain.setValue(180)
+        roi_grid.addWidget(self.spin_track_lateral_gain, 11, 1)
+
+        roi_grid.addWidget(QLabel("循迹航向增益 Kθ x100:"), 11, 2)
+        self.spin_track_heading_gain = QSpinBox()
+        self.spin_track_heading_gain.setRange(0, 400)
+        self.spin_track_heading_gain.setValue(200)
+        roi_grid.addWidget(self.spin_track_heading_gain, 11, 3)
+
+        roi_grid.addWidget(QLabel("目标转差限幅 (mm/s):"), 12, 0)
+        self.spin_track_max_delta = QSpinBox()
+        self.spin_track_max_delta.setRange(0, 200)
+        self.spin_track_max_delta.setValue(120)
+        roi_grid.addWidget(self.spin_track_max_delta, 12, 1)
+
+        roi_grid.addWidget(QLabel("实测转差不足补偿 x100:"), 12, 2)
+        self.spin_track_speed_feedback = QSpinBox()
+        self.spin_track_speed_feedback.setRange(0, 200)
+        self.spin_track_speed_feedback.setValue(75)
+        self.spin_track_speed_feedback.setToolTip(
+            "按视觉目标与编码器实测转差之差提高给定；0=关闭，75=补偿0.75倍")
+        roi_grid.addWidget(self.spin_track_speed_feedback, 12, 3)
+
         self.btn_apply_vision = QPushButton("下发算法参数")
         self.btn_apply_vision.setToolTip("将阈值、ROI、线宽、流模式、CLAHE 对比度增强、Otsu、边缘阈值、平滑滤波、形态学清理、平滑系数下发到 ESP32")
         self.btn_apply_vision.clicked.connect(self.apply_vision_params)
-        roi_grid.addWidget(self.btn_apply_vision, 11, 0, 1, 4)
+        roi_grid.addWidget(self.btn_apply_vision, 13, 0, 1, 4)
 
-        roi_grid.setRowStretch(12, 1)
+        roi_grid.setRowStretch(14, 1)
         param_layout.addWidget(roi_group)
 
         body_splitter.addWidget(param_widget)
@@ -993,8 +1172,14 @@ class MainWindow(QMainWindow):
         self.balance_age_timer = QTimer(self)
         self.balance_age_timer.setInterval(100)
         self.balance_age_timer.timeout.connect(self._update_balance_packet_age)
-        self.balance_tab = QWidget()
-        layout = QVBoxLayout(self.balance_tab)
+        # This page contains several control rows.  Keep their natural height
+        # in full-screen/small-height windows instead of letting QGridLayout
+        # compress rows until widgets overlap.
+        self.balance_tab = QScrollArea()
+        self.balance_tab.setWidgetResizable(True)
+        balance_content = QWidget()
+        self.balance_tab.setWidget(balance_content)
+        layout = QVBoxLayout(balance_content)
 
         connection_group = QGroupBox("主板 Wi-Fi / UDP 连接")
         connection_grid = QGridLayout(connection_group)
@@ -1040,18 +1225,16 @@ class MainWindow(QMainWindow):
         self.btn_balance_reset.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_reset, 3, 0, 1, 2)
 
-        connection_grid.addWidget(QLabel("前进 / 后退速度给定 (m/s):"), 3, 2)
+        connection_grid.addWidget(QLabel("前进速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
-        self.spin_balance_drive_speed.setRange(-0.250, 0.250)
+        self.spin_balance_drive_speed.setRange(0.0, 0.250)
         self.spin_balance_drive_speed.setSingleStep(0.010)
         self.spin_balance_drive_speed.setValue(0.0)
         self.spin_balance_drive_speed.setEnabled(False)
-        self.spin_balance_drive_speed.setToolTip(
-            "仅在 BALANCING 状态下可下发；正值前进、负值后退，主板会按 0.10 m/s² 斜坡改变给定"
-        )
+        self.spin_balance_drive_speed.setToolTip("仅在 BALANCING 状态下可下发；主板会按 0.10 m/s² 斜坡改变给定")
         connection_grid.addWidget(self.spin_balance_drive_speed, 3, 3)
-        self.btn_balance_drive = QPushButton("设置行驶速度")
+        self.btn_balance_drive = QPushButton("设置前进速度")
         self.btn_balance_drive.clicked.connect(self.request_balance_drive_speed)
         self.btn_balance_drive.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_drive, 3, 4, 1, 2)
@@ -1060,74 +1243,36 @@ class MainWindow(QMainWindow):
         self.btn_balance_drive_zero.setEnabled(False)
         connection_grid.addWidget(self.btn_balance_drive_zero, 3, 6, 1, 2)
 
-        connection_grid.addWidget(QLabel("转向差速度给定 (右-左, m/s):"), 4, 0, 1, 2)
-        self.spin_balance_turn_speed = QDoubleSpinBox()
-        self.spin_balance_turn_speed.setDecimals(3)
-        self.spin_balance_turn_speed.setRange(-0.200, 0.200)
-        self.spin_balance_turn_speed.setSingleStep(0.010)
-        self.spin_balance_turn_speed.setValue(0.0)
-        self.spin_balance_turn_speed.setEnabled(False)
-        self.spin_balance_turn_speed.setToolTip(
-            "仅在 BALANCING 状态下可下发；正值表示右轮比左轮快，负值表示左轮比右轮快"
-        )
-        connection_grid.addWidget(self.spin_balance_turn_speed, 4, 2)
-        self.btn_balance_turn = QPushButton("设置转向差速度")
-        self.btn_balance_turn.clicked.connect(self.request_balance_turn_speed)
-        self.btn_balance_turn.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_turn, 4, 3, 1, 2)
-        self.btn_balance_turn_zero = QPushButton("转向差速度清零")
-        self.btn_balance_turn_zero.clicked.connect(self.request_balance_turn_zero)
-        self.btn_balance_turn_zero.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_turn_zero, 4, 5, 1, 3)
+        self.btn_vision_tracking = QPushButton("启用摄像头循迹")
+        self.btn_vision_tracking.clicked.connect(self.toggle_vision_tracking)
+        self.btn_vision_tracking.setEnabled(False)
+        self.btn_vision_tracking.setToolTip("启用后，将相机 I2C 的目标左右轮速度差送给主板差速环；手动 TURN 会自动关闭。")
+        connection_grid.addWidget(self.btn_vision_tracking, 4, 0, 1, 3)
+        self.btn_vision_i2c_debug = QPushButton("查看循迹 I2C 状态")
+        self.btn_vision_i2c_debug.clicked.connect(self.show_vision_i2c_debug)
+        connection_grid.addWidget(self.btn_vision_i2c_debug, 4, 3, 1, 3)
 
-        connection_grid.addWidget(QLabel("方向快捷控制:"), 5, 0, 1, 2)
-        self.btn_balance_forward = QPushButton("↑ 前进")
-        self.btn_balance_forward.setToolTip("以速度输入框的绝对值前进，并清除转向差速度")
-        self.btn_balance_forward.clicked.connect(self.request_balance_forward)
-        self.btn_balance_forward.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_forward, 5, 2)
-        self.btn_balance_backward = QPushButton("↓ 后退")
-        self.btn_balance_backward.setToolTip("以速度输入框的绝对值后退，并清除转向差速度")
-        self.btn_balance_backward.clicked.connect(self.request_balance_backward)
-        self.btn_balance_backward.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_backward, 5, 3)
-        self.btn_balance_left = QPushButton("← 左转")
-        self.btn_balance_left.setToolTip("仅设定左转差速度，保持当前前进或后退速度")
-        self.btn_balance_left.clicked.connect(self.request_balance_left)
-        self.btn_balance_left.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_left, 5, 4)
-        self.btn_balance_right = QPushButton("→ 右转")
-        self.btn_balance_right.setToolTip("仅设定右转差速度，保持当前前进或后退速度")
-        self.btn_balance_right.clicked.connect(self.request_balance_right)
-        self.btn_balance_right.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_right, 5, 5)
-        self.btn_balance_motion_stop = QPushButton("停止行驶 / 转向")
-        self.btn_balance_motion_stop.setToolTip("平滑将行驶和转向目标清零；不停止平衡")
-        self.btn_balance_motion_stop.clicked.connect(self.request_balance_motion_stop)
-        self.btn_balance_motion_stop.setEnabled(False)
-        connection_grid.addWidget(self.btn_balance_motion_stop, 5, 6, 1, 2)
-
-        connection_grid.addWidget(QLabel("自动路线:"), 6, 0)
+        connection_grid.addWidget(QLabel("自动路线:"), 5, 0)
         self.cmb_route_direction = QComboBox()
         self.cmb_route_direction.addItems(["左转（两次半圆）", "右转（两次半圆）"])
-        connection_grid.addWidget(self.cmb_route_direction, 6, 1, 1, 2)
+        connection_grid.addWidget(self.cmb_route_direction, 5, 1, 1, 2)
         self.spin_route_turn = QDoubleSpinBox()
         self.spin_route_turn.setRange(0.01, 0.20)
         self.spin_route_turn.setDecimals(3)
         self.spin_route_turn.setSingleStep(0.01)
         self.spin_route_turn.setValue(0.060)
-        self.spin_route_turn.setToolTip("目标右减左轮速差（m/s）；需通过实际转弯半径校准")
-        connection_grid.addWidget(self.spin_route_turn, 6, 3)
+        self.spin_route_turn.setToolTip("转向混控量，需通过实际半径校准；轮距 0.20 m、目标半径 0.25 m")
+        connection_grid.addWidget(self.spin_route_turn, 5, 3)
         self.btn_route_start = QPushButton("执行 2m-半圆-2m-半圆")
         self.btn_route_start.clicked.connect(self.start_route)
         self.btn_route_start.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_start, 6, 4, 1, 2)
+        connection_grid.addWidget(self.btn_route_start, 5, 4, 1, 2)
         self.btn_route_cancel = QPushButton("取消路线")
         self.btn_route_cancel.clicked.connect(self.cancel_route)
         self.btn_route_cancel.setEnabled(False)
-        connection_grid.addWidget(self.btn_route_cancel, 6, 6)
+        connection_grid.addWidget(self.btn_route_cancel, 5, 6)
         self.lbl_route_status = QLabel("路线未运行")
-        connection_grid.addWidget(self.lbl_route_status, 7, 0, 1, 8)
+        connection_grid.addWidget(self.lbl_route_status, 6, 0, 1, 8)
         layout.addWidget(connection_group)
 
         live_group = QGroupBox("实时状态")
@@ -1140,8 +1285,7 @@ class MainWindow(QMainWindow):
             ("accel", "加速度 g (X,Y,Z)"), ("gyro", "陀螺仪 °/s (X,Y,Z)"),
             ("speed", "目标 / 实际速度 (m/s)"), ("speed_error", "速度误差 (m/s)"),
             ("wheel_speed", "左右车轮线速度 (m/s)"),
-            ("heading", "相对航向 / 转向角速度 (° / °/s)"),
-            ("pitch_offset", "速度环俯角输出 (°)"), ("turn", "目标/实际差速度与转向输出"),
+            ("pitch_offset", "速度环俯角输出 (°)"),
             ("motor", "左右电机输出"), ("packet", "包序号 / 包龄 / 频率"),
         ]
         for index, (key, title) in enumerate(status_fields):
@@ -1151,23 +1295,38 @@ class MainWindow(QMainWindow):
             value_label.setMinimumWidth(145)
             self.balance_value_labels[key] = value_label
             live_grid.addWidget(value_label, row, column * 2 + 1)
+        # The vision hand-off chain is intentionally shown in one full-width
+        # row. A normal 145 px status cell would truncate the important
+        # camera/accepted/target/measured/applied values.
+        turn_row = (len(status_fields) + 2) // 3
+        live_grid.addWidget(QLabel("视觉差速闭环 (m/s):"), turn_row, 0)
+        turn_label = QLabel("-")
+        turn_label.setWordWrap(True)
+        turn_label.setMinimumHeight(42)
+        turn_label.setMinimumWidth(520)
+        turn_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.balance_value_labels["turn"] = turn_label
+        live_grid.addWidget(turn_label, turn_row, 1, 1, 5)
         layout.addWidget(live_group)
 
         tuning_group = QGroupBox("在线 PID / PI 参数（仅调参，不含启动、急停、速度或转向命令）")
         tuning_grid = QGridLayout(tuning_group)
         self.balance_tuning_spins = {}
         tuning_fields = [
-            ("balance_kp", "角度 Kp", 0.12, 5),
+            ("balance_kp", "角度 Kp", 0.09, 5),
             ("balance_ki", "角度 Ki", 0.0, 5),
             ("balance_kd", "角度 Kd", 0.003, 5),
             ("balance_trim", "平衡点 Trim (°)", -2.09, 3),
-            ("speed_kp", "速度 Kp", 11.0, 5),
+            ("speed_kp", "速度 Kp", 13.0, 5),
             ("speed_ki", "速度 Ki", 0.15, 6),
-            ("turn_kp", "差速度 Kp", 1.0, 5),
-            ("turn_ki", "差速度 Ki", 0.0, 6),
-            ("max_turn", "最大转向输出 (0–1)", 0.20, 3),
             ("max_motor", "最大电机输出 (0–1)", 0.45, 3),
             ("max_pitch", "最大俯仰偏置 (°)", 6.0, 2),
+            ("turn_kp", "转差环 Kp", 1.0, 4),
+            ("turn_ki", "转差环 Ki", 0.0, 4),
+            ("turn_max", "最大转向输出 (0–1)", 0.20, 3),
+            ("vision_period", "视觉转差更新间隔 (ms)", 400.0, 0),
+            ("vision_max_step", "单次转差最大变化 (mm/s, 0=不限)", 0.0, 0),
+            ("vision_curve_hold_mmps", "弯道锁存测试转差 (mm/s)", 120.0, 0),
         ]
         for index, (key, title, value, decimals) in enumerate(tuning_fields):
             row, column = divmod(index, 3)
@@ -1177,9 +1336,26 @@ class MainWindow(QMainWindow):
             if key == "balance_trim":
                 spin.setRange(-20.0, 20.0)
                 spin.setSingleStep(0.05)
-            elif key in ("max_motor", "max_turn"):
+            elif key in ("max_motor", "turn_max"):
                 spin.setRange(0.0, 1.0)
                 spin.setSingleStep(0.01)
+            elif key == "turn_kp":
+                spin.setRange(0.0, 10.0)
+                spin.setSingleStep(0.1)
+            elif key == "turn_ki":
+                spin.setRange(0.0, 2.0)
+                spin.setSingleStep(0.01)
+            elif key == "vision_period":
+                # 仅限制相机转差给定的更新频率，不影响 I2C 50 Hz 状态交换。
+                # 默认 400 ms；I2C 仍以 50 Hz 向加权滑动窗口提供样本。
+                spin.setRange(100.0, 5000.0)
+                spin.setSingleStep(100.0)
+            elif key == "vision_max_step":
+                spin.setRange(0.0, 200.0)
+                spin.setSingleStep(5.0)
+            elif key == "vision_curve_hold_mmps":
+                spin.setRange(20.0, 200.0)
+                spin.setSingleStep(10.0)
             elif key == "max_pitch":
                 spin.setRange(0.0, 15.0)
                 spin.setSingleStep(0.1)
@@ -1196,12 +1372,21 @@ class MainWindow(QMainWindow):
         )
         self.btn_apply_balance_loop_tuning.clicked.connect(self.apply_balance_loop_tuning)
         self.btn_apply_balance_loop_tuning.setEnabled(False)
-        tuning_grid.addWidget(self.btn_apply_balance_loop_tuning, 4, 0, 1, 3)
+        self.chk_vision_filter = QCheckBox("启用视觉转差加权滑动滤波")
+        self.chk_vision_filter.setChecked(True)
+        self.chk_vision_filter.setToolTip("最近5个有效相机dv按1:2:3:4:5加权，最新样本权重最高；关闭后采用最新dv")
+        tuning_grid.addWidget(self.chk_vision_filter, 5, 0, 1, 3)
+        self.chk_vision_curve_hold = QCheckBox("弯道失线后保持最大转差")
+        self.chk_vision_curve_hold.setChecked(True)
+        self.chk_vision_curve_hold.setToolTip(
+            "连续两帧确认方向后，valid=0 时按该方向保持最大转差；valid=1 后立即恢复视觉给定")
+        tuning_grid.addWidget(self.chk_vision_curve_hold, 5, 3, 1, 3)
+        tuning_grid.addWidget(self.btn_apply_balance_loop_tuning, 6, 0, 1, 3)
 
-        self.btn_apply_balance_tuning = QPushButton("应用全部参数（含速度环）")
+        self.btn_apply_balance_tuning = QPushButton("应用全部参数（含速度 / 转差环）")
         self.btn_apply_balance_tuning.clicked.connect(self.apply_balance_tuning)
         self.btn_apply_balance_tuning.setEnabled(False)
-        tuning_grid.addWidget(self.btn_apply_balance_tuning, 4, 3, 1, 3)
+        tuning_grid.addWidget(self.btn_apply_balance_tuning, 6, 3, 1, 3)
         layout.addWidget(tuning_group)
 
         console_group = QGroupBox("主板串口日志镜像")
@@ -1214,6 +1399,115 @@ class MainWindow(QMainWindow):
         layout.addWidget(console_group)
         layout.addStretch()
         self.tabs.addTab(self.balance_tab, "主板调试")
+
+    def _build_calibration_tab(self):
+        """Manual calibration page.  Every click is made on one frozen raw frame."""
+        self.calibration_tab = QWidget()
+        layout = QVBoxLayout(self.calibration_tab)
+        intro = QLabel(
+            "当前页直接显示相机原始图。先请求 M=0 原始图，再定格。黑线双点只校正像素零点；棋盘 A-F 用于平地物理验证，不用于坡道控制。"
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        preview_group = QGroupBox("标定画面（点选前必须定格）")
+        preview_layout = QVBoxLayout(preview_group)
+        self.calib_preview = CalibrationImageLabel()
+        self.calib_preview.image_clicked.connect(self._on_calibration_image_clicked)
+        preview_layout.addWidget(self.calib_preview)
+        preview_buttons = QHBoxLayout()
+        self.btn_request_raw = QPushButton("请求原始画靪 M=0")
+        self.btn_request_raw.clicked.connect(self.request_calibration_raw_frame)
+        self.btn_freeze_calib = QPushButton("定格当前画面")
+        self.btn_freeze_calib.clicked.connect(self.freeze_calibration_frame)
+        self.btn_resume_calib = QPushButton("恢复实时画面")
+        self.btn_resume_calib.clicked.connect(self.resume_calibration_frame)
+        self.btn_undo_calib = QPushButton("撤销点")
+        self.btn_undo_calib.clicked.connect(self.undo_calibration_point)
+        self.btn_clear_calib = QPushButton("清空点")
+        self.btn_clear_calib.clicked.connect(self.clear_calibration_points)
+        self.lbl_calib_frame = QLabel("等待相机图传…")
+        for button in (self.btn_request_raw, self.btn_freeze_calib, self.btn_resume_calib,
+                       self.btn_undo_calib, self.btn_clear_calib):
+            preview_buttons.addWidget(button)
+        preview_buttons.addWidget(self.lbl_calib_frame, 1)
+        preview_layout.addLayout(preview_buttons)
+        layout.addWidget(preview_group)
+
+        settings = QGroupBox("棋盘参数（与手机/平板上实际显示的格宽一致）")
+        grid = QGridLayout(settings)
+        grid.addWidget(QLabel("内角点列数:"), 0, 0)
+        self.calib_cols = QSpinBox(); self.calib_cols.setRange(3, 20); self.calib_cols.setValue(9)
+        grid.addWidget(self.calib_cols, 0, 1)
+        grid.addWidget(QLabel("内角点行数:"), 0, 2)
+        self.calib_rows = QSpinBox(); self.calib_rows.setRange(3, 20); self.calib_rows.setValue(6)
+        grid.addWidget(self.calib_rows, 0, 3)
+        grid.addWidget(QLabel("实际格宽 (mm):"), 0, 4)
+        self.calib_square_mm = QDoubleSpinBox(); self.calib_square_mm.setRange(1.0, 200.0)
+        self.calib_square_mm.setValue(20.0); self.calib_square_mm.setDecimals(2)
+        grid.addWidget(self.calib_square_mm, 0, 5)
+        self.btn_export_pattern = QPushButton("导出手机/平板棋盘 PNG")
+        self.btn_export_pattern.clicked.connect(self.export_calibration_pattern)
+        grid.addWidget(self.btn_export_pattern, 0, 6)
+        layout.addWidget(settings)
+
+        intrinsic = QGroupBox("步骤 1：相机内参（每张样本都先定格）")
+        igrid = QGridLayout(intrinsic)
+        self.btn_capture_intrinsic = QPushButton("采集当前原始画面")
+        self.btn_capture_intrinsic.clicked.connect(self.capture_intrinsic_sample)
+        igrid.addWidget(self.btn_capture_intrinsic, 0, 0)
+        self.btn_solve_intrinsic = QPushButton("计算内参（至少 20 张）")
+        self.btn_solve_intrinsic.clicked.connect(self.solve_intrinsic_calibration)
+        igrid.addWidget(self.btn_solve_intrinsic, 0, 1)
+        self.lbl_intrinsic_status = QLabel("尚未采集样本")
+        self.lbl_intrinsic_status.setWordWrap(True)
+        igrid.addWidget(self.lbl_intrinsic_status, 1, 0, 1, 2)
+        layout.addWidget(intrinsic)
+
+        line = QGroupBox("步骤 2：人工黑线零点对齐（不需测距离）")
+        lgrid = QGridLayout(line)
+        self.btn_line_mode = QPushButton("选择黑线双点")
+        self.btn_line_mode.clicked.connect(lambda: self._set_calibration_mode("line"))
+        self.btn_save_alignment = QPushButton("保存零点并生成固件配置")
+        self.btn_save_alignment.clicked.connect(self.save_manual_track_alignment)
+        lgrid.addWidget(self.btn_line_mode, 0, 0)
+        lgrid.addWidget(self.btn_save_alignment, 0, 1)
+        lgrid.addWidget(QLabel("K_e:"), 0, 2)
+        self.spin_align_ke = QDoubleSpinBox(); self.spin_align_ke.setRange(0.0, 2.0); self.spin_align_ke.setDecimals(3); self.spin_align_ke.setValue(0.40)
+        lgrid.addWidget(self.spin_align_ke, 0, 3)
+        lgrid.addWidget(QLabel("K_θ:"), 0, 4)
+        self.spin_align_kh = QDoubleSpinBox(); self.spin_align_kh.setRange(0.0, 2.0); self.spin_align_kh.setDecimals(3); self.spin_align_kh.setValue(0.60)
+        lgrid.addWidget(self.spin_align_kh, 0, 5)
+        self.lbl_line_status = QLabel("先定格，然后点击远端辅助线与黑线中心的交点，再点击近端交点。")
+        self.lbl_line_status.setWordWrap(True)
+        lgrid.addWidget(self.lbl_line_status, 1, 0, 1, 6)
+        layout.addWidget(line)
+
+        ground = QGroupBox("步骤 3：人工平地物理验证（不用于循迹控制）")
+        ggrid = QGridLayout(ground)
+        ggrid.addWidget(QLabel("A 内角点 X (m，右正):"), 0, 0)
+        self.ground_x = QDoubleSpinBox(); self.ground_x.setRange(-5.0, 5.0); self.ground_x.setDecimals(3)
+        ggrid.addWidget(self.ground_x, 0, 1)
+        ggrid.addWidget(QLabel("A 内角点 Y (m，前正):"), 0, 2)
+        self.ground_y = QDoubleSpinBox(); self.ground_y.setRange(-1.0, 10.0); self.ground_y.setDecimals(3)
+        ggrid.addWidget(self.ground_y, 0, 3)
+        fixed_direction = QLabel("固定摆放：屏幕顶边朝车头，A 在左上角（无需测角）")
+        fixed_direction.setWordWrap(True)
+        ggrid.addWidget(fixed_direction, 0, 4, 1, 2)
+        self.btn_flat_mode = QPushButton("选择棋盘 A-F 点选")
+        self.btn_flat_mode.clicked.connect(lambda: self._set_calibration_mode("flat"))
+        ggrid.addWidget(self.btn_flat_mode, 1, 0, 1, 3)
+        self.btn_solve_ground = QPushButton("验证并保存平地结果")
+        self.btn_solve_ground.clicked.connect(self.solve_manual_flat_validation)
+        ggrid.addWidget(self.btn_solve_ground, 1, 3, 1, 3)
+        self.lbl_ground_status = QLabel("定格后按 A→B→C→D→E→F 点选棋盘内角点。A-D 拟合，E/F 验证；需实测 A 的 X/Y 与格宽。")
+        self.lbl_ground_status.setWordWrap(True)
+        ggrid.addWidget(self.lbl_ground_status, 2, 0, 1, 6)
+        layout.addWidget(ground)
+        layout.addStretch()
+        self.tabs.addTab(self.calibration_tab, "相机标定")
+        self._restore_intrinsic_calibration()
+        self._restore_track_alignment()
 
     def _apply_styles(self):
         self.setStyleSheet("""
@@ -1233,7 +1527,10 @@ class MainWindow(QMainWindow):
                 padding: 0 5px;
             }
             QPushButton {
-                padding: 6px 14px;
+                min-height: 34px;
+                min-width: 108px;
+                max-width: 300px;
+                padding: 7px 14px;
                 background-color: #2196F3;
                 color: white;
                 border: none;
@@ -1289,14 +1586,6 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setEnabled(False)
         self.btn_balance_drive.setEnabled(False)
         self.btn_balance_drive_zero.setEnabled(False)
-        self.spin_balance_turn_speed.setEnabled(False)
-        self.btn_balance_turn.setEnabled(False)
-        self.btn_balance_turn_zero.setEnabled(False)
-        self.btn_balance_forward.setEnabled(False)
-        self.btn_balance_backward.setEnabled(False)
-        self.btn_balance_left.setEnabled(False)
-        self.btn_balance_right.setEnabled(False)
-        self.btn_balance_motion_stop.setEnabled(False)
         self.btn_route_start.setEnabled(False)
         self.btn_route_cancel.setEnabled(False)
         self.balance_ip_edit.setEnabled(False)
@@ -1330,14 +1619,6 @@ class MainWindow(QMainWindow):
             self.spin_balance_drive_speed.setEnabled(False)
             self.btn_balance_drive.setEnabled(False)
             self.btn_balance_drive_zero.setEnabled(False)
-            self.spin_balance_turn_speed.setEnabled(False)
-            self.btn_balance_turn.setEnabled(False)
-            self.btn_balance_turn_zero.setEnabled(False)
-            self.btn_balance_forward.setEnabled(False)
-            self.btn_balance_backward.setEnabled(False)
-            self.btn_balance_left.setEnabled(False)
-            self.btn_balance_right.setEnabled(False)
-            self.btn_balance_motion_stop.setEnabled(False)
             self.cancel_route(send_stop=False)
             self.btn_route_start.setEnabled(False)
             self.balance_ip_edit.setEnabled(True)
@@ -1368,10 +1649,9 @@ class MainWindow(QMainWindow):
                 "left_wheel_mps", "right_wheel_mps",
                 "balance_kp", "balance_ki", "balance_kd", "balance_trim",
                 "speed_kp", "speed_ki", "speed_invert", "target_speed",
-                "target_differential_speed_mps", "filtered_differential_speed_mps",
+                "target_differential_speed_mps", "measured_differential_speed_mps",
                 "differential_speed_error_mps", "turn_motor_command", "applied_turn_motor_command",
-                "turn_kp", "turn_ki", "max_turn", "turn_invert",
-                "relative_heading_deg", "yaw_rate_deg_per_s",
+                "vision_tracking_enabled", "vision_sample_fresh", "vision_command_accepted", "camera_delta_speed_mps",
             ])
             self.speed_record_file.flush()
             self.log(f"速度记录已开始：{self.speed_record_path}")
@@ -1421,12 +1701,12 @@ class MainWindow(QMainWindow):
                 f"{telemetry['speed_kp']:.6f}", f"{telemetry['speed_ki']:.6f}",
                 "" if telemetry.get("speed_invert") is None else telemetry["speed_invert"],
                 f"{telemetry['target_speed']:.6f}",
-                f"{telemetry['turn']:.6f}", optional_float("differential_speed"),
-                optional_float("differential_speed_error"), optional_float("turn_motor_command"),
-                optional_float("applied_turn_motor_command"), optional_float("turn_kp"),
-                optional_float("turn_ki"), optional_float("max_turn"),
-                "" if telemetry.get("turn_invert") is None else telemetry["turn_invert"],
-                optional_float("heading"), optional_float("yaw_rate"),
+                optional_float("turn"), optional_float("diff_speed"), optional_float("diff_error"),
+                optional_float("turn_motor"), optional_float("turn_applied"),
+                "" if telemetry.get("vision_tracking") is None else int(telemetry["vision_tracking"]),
+                "" if telemetry.get("vision_fresh") is None else int(telemetry["vision_fresh"]),
+                "" if telemetry.get("vision_accepted") is None else int(telemetry["vision_accepted"]),
+                optional_float("vision_dv"),
             ])
             # 每包落盘，异常关闭时也最多损失当前一行记录。
             self.speed_record_file.flush()
@@ -1439,11 +1719,17 @@ class MainWindow(QMainWindow):
             ("balance", "kp", "balance_kp"), ("balance", "ki", "balance_ki"),
             ("balance", "kd", "balance_kd"), ("balance", "trim", "balance_trim"),
             ("speed", "kp", "speed_kp"), ("speed", "ki", "speed_ki"),
-            ("turn", "kp", "turn_kp"), ("turn", "ki", "turn_ki"), ("turn", "max", "max_turn"),
             ("balance", "max_motor", "max_motor"), ("speed", "max_pitch", "max_pitch"),
+            ("turn", "kp", "turn_kp"), ("turn", "ki", "turn_ki"),
+            ("turn", "max", "turn_max"),
+            ("vision", "period_ms", "vision_period"),
+            ("vision", "max_step_mmps", "vision_max_step"),
+            ("vision", "filter", "vision_filter"),
+            ("vision", "curve_hold_mmps", "vision_curve_hold_mmps"),
+            ("vision", "curve_hold", "vision_curve_hold"),
         ]
         self._send_tuning_commands(
-            command_fields, "已发送全部 PID / PI、平衡点 Trim 与输出限幅参数，等待主板 ACK 与遥测回读"
+            command_fields, "已发送平衡、速度、转差环参数与输出限幅，等待主板 ACK 与遥测回读"
         )
 
     def apply_balance_loop_tuning(self):
@@ -1464,7 +1750,12 @@ class MainWindow(QMainWindow):
         self.btn_apply_balance_tuning.setEnabled(False)
         for domain, parameter, key in command_fields:
             self.balance_command_sequence += 1
-            value = self.balance_tuning_spins[key].value()
+            if key == "vision_filter":
+                value = 1.0 if self.chk_vision_filter.isChecked() else 0.0
+            elif key == "vision_curve_hold":
+                value = 1.0 if self.chk_vision_curve_hold.isChecked() else 0.0
+            else:
+                value = self.balance_tuning_spins[key].value()
             self.balance_pending_tuning[key] = value
             self.balance_pending_sequences[self.balance_command_sequence] = {
                 "key": key, "domain": domain, "parameter": parameter, "value": value,
@@ -1582,88 +1873,40 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setValue(0.0)
         self._send_balance_control("DRIVE", 0.0)
 
-    def _cancel_route_for_manual_drive(self):
-        if self.route_active:
-            self.cancel_route()
-
-    def _drive_speed_magnitude(self):
-        speed = abs(self.spin_balance_drive_speed.value())
-        return speed if speed >= 0.001 else 0.060
-
-    def _turn_speed_magnitude(self):
-        speed = abs(self.spin_balance_turn_speed.value())
-        return speed if speed >= 0.001 else 0.060
-
-    def request_balance_forward(self):
+    def toggle_vision_tracking(self):
         if self.balance_worker is None:
             return
-        self._cancel_route_for_manual_drive()
-        speed = self._drive_speed_magnitude()
-        self.spin_balance_drive_speed.setValue(speed)
-        self.spin_balance_turn_speed.setValue(0.0)
-        self._send_balance_control("TURN", 0.0)
-        self._send_balance_control("DRIVE", speed)
+        enabled = self.btn_vision_tracking.property("tracking_enabled") is not True
+        self._send_balance_control("TRACK", 1 if enabled else 0)
+        self.btn_vision_tracking.setProperty("tracking_enabled", enabled)
+        self.btn_vision_tracking.setText("关闭摄像头循迹" if enabled else "启用摄像头循迹")
 
-    def request_balance_backward(self):
-        if self.balance_worker is None:
-            return
-        self._cancel_route_for_manual_drive()
-        speed = -self._drive_speed_magnitude()
-        self.spin_balance_drive_speed.setValue(speed)
-        self.spin_balance_turn_speed.setValue(0.0)
-        self._send_balance_control("TURN", 0.0)
-        self._send_balance_control("DRIVE", speed)
-
-    def request_balance_left(self):
-        if self.balance_worker is None:
-            return
-        self._cancel_route_for_manual_drive()
-        speed = self._turn_speed_magnitude()
-        self.spin_balance_turn_speed.setValue(speed)
-        self._send_balance_control("TURN", speed)
-
-    def request_balance_right(self):
-        if self.balance_worker is None:
-            return
-        self._cancel_route_for_manual_drive()
-        speed = -self._turn_speed_magnitude()
-        self.spin_balance_turn_speed.setValue(speed)
-        self._send_balance_control("TURN", speed)
-
-    def request_balance_motion_stop(self):
-        if self.balance_worker is None:
-            return
-        self._cancel_route_for_manual_drive()
-        self.spin_balance_drive_speed.setValue(0.0)
-        self.spin_balance_turn_speed.setValue(0.0)
-        self._send_balance_control("TURN", 0.0)
-        self._send_balance_control("DRIVE", 0.0)
-
-    def request_balance_turn_speed(self):
-        if self.balance_worker is None:
-            self.log("请先连接主板 Wi-Fi 调试端口")
-            return
-        if self.route_active:
-            self.cancel_route()
-        self._send_balance_control("TURN", self.spin_balance_turn_speed.value())
-
-    def request_balance_turn_zero(self):
-        if self.balance_worker is None:
-            return
-        if self.route_active:
-            self.cancel_route()
-        self.spin_balance_turn_speed.setValue(0.0)
-        self._send_balance_control("TURN", 0.0)
+    def show_vision_i2c_debug(self):
+        if getattr(self, "vision_i2c_debug_dialog", None) is None:
+            self.vision_i2c_debug_dialog = VisionI2cDebugDialog(self)
+        self.vision_i2c_debug_dialog.show()
+        self.vision_i2c_debug_dialog.raise_()
+        self.vision_i2c_debug_dialog.activateWindow()
 
     def _send_balance_control(self, action: str, value: float = None):
         self.balance_command_sequence += 1
         command = f"C,{self.balance_command_sequence},{action}"
         if value is not None:
-            command += f",{value:.3f}"
+            # TRACK is deliberately a Boolean wire field, not a floating
+            # value.  The mainboard protocol accepts exactly `0` or `1`.
+            if action.upper() == "TRACK":
+                command += ",1" if float(value) >= 0.5 else ",0"
+            else:
+                command += f",{value:.3f}"
         command += "\n"
         self.balance_worker.queue_command(command.encode("ascii"))
-        suffix = "" if value is None else f" {value:.3f} m/s"
-        self.log(f"已发送主板控制命令：{action}{suffix}")
+        if value is None:
+            suffix = ""
+        elif action.upper() == "TRACK":
+            suffix = " 1" if float(value) >= 0.5 else " 0"
+        else:
+            suffix = f" {value:.3f} m/s"
+        self.log(f"已发送主板控制命令：{action}{suffix}（线协议：{command.strip()}）")
 
     def on_balance_telemetry(self, telemetry: dict):
         sequence = telemetry["sequence"]
@@ -1692,8 +1935,7 @@ class MainWindow(QMainWindow):
         if "rx_hz" in telemetry:
             self.balance_rx_hz = telemetry["rx_hz"]
         state_names = ["BOOT", "SELF_TESTING", "STANDBY", "MANUAL_TEST", "BALANCING", "FAULT"]
-        fault_names = ["NONE", "SELF_TEST_FAILED", "IMU_UNHEALTHY", "PITCH_LIMIT_EXCEEDED",
-                       "AIRBORNE_LANDING_FAILED"]
+        fault_names = ["NONE", "SELF_TEST_FAILED", "IMU_UNHEALTHY", "PITCH_LIMIT_EXCEEDED"]
         state = state_names[telemetry["state"]] if 0 <= telemetry["state"] < len(state_names) else "UNKNOWN"
         fault = fault_names[telemetry["fault"]] if 0 <= telemetry["fault"] < len(fault_names) else "UNKNOWN"
         value = self.balance_value_labels
@@ -1715,22 +1957,27 @@ class MainWindow(QMainWindow):
         value["wheel_speed"].setText(
             "-" if left_wheel is None else f"{left_wheel:.3f}, {right_wheel:.3f}"
         )
-        heading = telemetry.get("heading")
-        yaw_rate = telemetry.get("yaw_rate")
-        value["heading"].setText(
-            "-" if heading is None or yaw_rate is None else f"{heading:.2f} / {yaw_rate:.2f}"
-        )
         value["speed_error"].setText(f"{telemetry['speed_error']:.3f}")
         value["pitch_offset"].setText(f"{telemetry['pitch_offset']:.3f}")
-        differential_speed = telemetry.get("differential_speed")
-        turn_motor_command = telemetry.get("turn_motor_command")
-        applied_turn_motor_command = telemetry.get("applied_turn_motor_command")
-        if differential_speed is None or turn_motor_command is None or applied_turn_motor_command is None:
-            value["turn"].setText(f"目标 {telemetry['turn']:.3f}")
+        if telemetry.get("vision_dv") is not None:
+            accepted = telemetry.get("vision_accepted")
+            accepted_text = "—" if accepted is None else str(int(accepted))
+            value["turn"].setText(
+                f"相机 Δv {telemetry['vision_dv']:.3f} / 接管 {accepted_text} / "
+                f"主板目标 Δv {telemetry['turn']:.3f}\n"
+                f"实测 Δv {telemetry['diff_speed']:.3f} / 差速环输出 {telemetry['turn_motor']:.3f} / "
+                f"混控已施加 {telemetry['turn_applied']:.3f}"
+            )
+        elif telemetry.get("telemetry_version", 0) >= 5:
+            value["turn"].setText(
+                f"主板遥测 T{telemetry['telemetry_version']} 未回传相机接管状态；请烧录支持 T7 的主板固件。"
+            )
+        elif telemetry.get("diff_speed") is None:
+            value["turn"].setText(f"{telemetry['turn']:.3f}")
         else:
             value["turn"].setText(
-                f"{telemetry['turn']:.3f} / {differential_speed:.3f} m/s，"
-                f"{turn_motor_command:.3f} / {applied_turn_motor_command:.3f}"
+                f"目标 Δv {telemetry['turn']:.3f} / 实测 Δv {telemetry['diff_speed']:.3f} / "
+                f"差速环输出 {telemetry['turn_motor']:.3f} / 混控已施加 {telemetry['turn_applied']:.3f}"
             )
         value["motor"].setText(f"{telemetry['motor_left']:.3f}, {telemetry['motor_right']:.3f}")
         if not self.balance_tuning_loaded:
@@ -1740,6 +1987,8 @@ class MainWindow(QMainWindow):
             for key in self.balance_tuning_spins:
                 if telemetry.get(key) is not None:
                     self.balance_tuning_spins[key].setValue(telemetry[key])
+            if telemetry.get("vision_filter") is not None:
+                self.chk_vision_filter.setChecked(telemetry["vision_filter"])
             self.balance_tuning_loaded = True
             self.btn_apply_balance_loop_tuning.setEnabled(True)
             self.btn_apply_balance_tuning.setEnabled(True)
@@ -1755,15 +2004,12 @@ class MainWindow(QMainWindow):
         self.spin_balance_drive_speed.setEnabled(drive_enabled)
         self.btn_balance_drive.setEnabled(drive_enabled)
         self.btn_balance_drive_zero.setEnabled(drive_enabled)
-        turn_enabled = drive_enabled and not self.route_active
-        self.spin_balance_turn_speed.setEnabled(turn_enabled)
-        self.btn_balance_turn.setEnabled(turn_enabled)
-        self.btn_balance_turn_zero.setEnabled(turn_enabled)
-        self.btn_balance_forward.setEnabled(drive_enabled)
-        self.btn_balance_backward.setEnabled(drive_enabled)
-        self.btn_balance_left.setEnabled(turn_enabled)
-        self.btn_balance_right.setEnabled(turn_enabled)
-        self.btn_balance_motion_stop.setEnabled(drive_enabled)
+        tracking_reported = telemetry.get("vision_tracking")
+        tracking_enabled = (self.btn_vision_tracking.property("tracking_enabled") is True
+                            if tracking_reported is None else bool(tracking_reported))
+        self.btn_vision_tracking.setEnabled(drive_enabled)
+        self.btn_vision_tracking.setProperty("tracking_enabled", tracking_enabled)
+        self.btn_vision_tracking.setText("关闭摄像头循迹" if tracking_enabled else "启用摄像头循迹")
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
         self._update_balance_packet_age(sequence)
@@ -1803,7 +2049,12 @@ class MainWindow(QMainWindow):
             return
 
         self.balance_pending_tuning.pop(key, None)
-        self.balance_tuning_spins[key].setValue(actual_value)
+        if key == "vision_filter":
+            self.chk_vision_filter.setChecked(actual_value >= 0.5)
+        elif key == "vision_curve_hold":
+            self.chk_vision_curve_hold.setChecked(actual_value >= 0.5)
+        else:
+            self.balance_tuning_spins[key].setValue(actual_value)
         self.log(f"参数已由主板 ACK 确认：{key}={actual_value:.5f}")
         self._finish_tuning_transaction()
 
@@ -1823,6 +2074,10 @@ class MainWindow(QMainWindow):
     def on_balance_console_line(self, line: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.balance_console_log.append(f"[{timestamp}] {line}")
+        if line.startswith("[I2C]"):
+            if getattr(self, "vision_i2c_debug_dialog", None) is None:
+                self.vision_i2c_debug_dialog = VisionI2cDebugDialog(self)
+            self.vision_i2c_debug_dialog.append_line(line)
 
     def _update_balance_packet_age(self, sequence=None):
         if self.balance_last_received_monotonic is None:
@@ -1861,6 +2116,7 @@ class MainWindow(QMainWindow):
     # -----------------------------------------------------------------------
     def start_stream(self):
         self.stop_worker()
+        self._stream_generation += 1
         protocol = self.cmb_protocol.currentIndex()
 
         if protocol == 0:
@@ -1881,18 +2137,21 @@ class MainWindow(QMainWindow):
             self.log(f"Start UDP stream: listen {local_port}, cmd {esp_ip}:{cmd_port}")
             self.worker = UdpStreamWorker(local_port, esp_ip, cmd_port)
 
+        worker = self.worker
+        # Every callback is tied to this exact worker.  A delayed failure from
+        # an old HTTP session can therefore never affect a new UDP session.
+        if not isinstance(worker, UdpStreamWorker):
+            worker.frame_ready.connect(lambda image, source=worker: self._queue_worker_frame(source, image))
+        worker.fps_updated.connect(lambda fps, source=worker: self._on_worker_fps(source, fps))
+        worker.info_updated.connect(lambda text, source=worker: self._on_worker_info(source, text))
+        worker.error_occurred.connect(lambda text, source=worker: self._on_worker_error(source, text))
         if isinstance(self.worker, UdpStreamWorker):
-            self.worker.latest_frame_available.connect(self.on_udp_latest_frame)
-        else:
-            self.worker.frame_ready.connect(self.on_frame)
-        self.worker.fps_updated.connect(self.on_fps)
-        self.worker.info_updated.connect(self.log)
-        self.worker.error_occurred.connect(self.on_error)
-        if isinstance(self.worker, UdpStreamWorker):
-            self.worker.stats_updated.connect(self.on_udp_stats)
+            self.worker.stats_updated.connect(
+                lambda text, source=worker: self._on_worker_udp_stats(source, text))
         else:
             self.lbl_udp_stats.setText("UDP: -")
         self.worker.start()
+        self._display_timer.start()
 
         # UDP 模式下启动后自动把当前算法参数下发给 ESP32
         if isinstance(self.worker, UdpStreamWorker):
@@ -1901,9 +2160,12 @@ class MainWindow(QMainWindow):
         self._set_running_ui(True)
 
     def stop_worker(self):
-        if self.worker is not None:
-            self.worker.stop()
-            self.worker = None
+        old_worker = self.worker
+        self.worker = None
+        self._pending_display_frame = None
+        self._display_timer.stop()
+        if old_worker is not None:
+            old_worker.stop()
         self._set_running_ui(False)
         self.lbl_udp_stats.setText("UDP: -")
 
@@ -1965,6 +2227,10 @@ class MainWindow(QMainWindow):
         smooth_alpha = self.spin_smooth.value()
         row_gap = self.spin_row_gap.value()
         hold_frames = self.spin_hold_frames.value()
+        track_lateral_gain = self.spin_track_lateral_gain.value()
+        track_heading_gain = self.spin_track_heading_gain.value()
+        track_max_delta = self.spin_track_max_delta.value()
+        track_speed_feedback = self.spin_track_speed_feedback.value()
 
         self.worker.send_command(encode_udp_command(mode=mode))
         self.worker.send_command(encode_udp_command(threshold=threshold))
@@ -1983,46 +2249,293 @@ class MainWindow(QMainWindow):
         self.worker.send_command(encode_udp_command(smooth_alpha=smooth_alpha))
         self.worker.send_command(encode_udp_command(max_row_gap=row_gap))
         self.worker.send_command(encode_udp_command(max_hold_frames=hold_frames))
+        self.worker.send_command(encode_udp_command(
+            tracking_tuning=(track_lateral_gain, track_heading_gain,
+                             track_max_delta, track_speed_feedback)))
         self.log(
             f"Sent UDP cmd: M={mode}, T={threshold}, R={y1},{y2}, Y={lookahead_y}, "
             f"W={wmin},{wmax}, G={contrast100}, O={int(otsu)}, "
             f"L={otsu_min},{otsu_max}, J={otsu_step}, A={otsu_alpha}, P={fg_min},{fg_max}, "
             f"E={edge_thr}, F={int(smooth)}, C={int(morph)}, S={smooth_alpha}, "
-            f"D={row_gap}, H={hold_frames}"
+            f"D={row_gap}, H={hold_frames}, "
+            f"K={track_lateral_gain},{track_heading_gain},{track_max_delta},{track_speed_feedback}"
         )
 
     # -----------------------------------------------------------------------
     # 图像与处理
     # -----------------------------------------------------------------------
-    def on_udp_latest_frame(self):
-        """从 UDP 工作线程取最新帧；旧帧已被覆盖，不会累积显示延迟。"""
-        if not isinstance(self.worker, UdpStreamWorker):
+    def _raw_calibration_frame(self):
+        if self.calibration_frozen_frame is None:
+            QMessageBox.warning(self, "标定", "请先在本页点击“定格当前画面”。")
+            return None
+        return self.calibration_frozen_frame.copy()
+
+    def request_calibration_raw_frame(self):
+        if self.last_frame is None:
+            QMessageBox.warning(self, "标定", "请先启动相机图传并获得一帧画面。")
+            return None
+        if self.cmb_vision_mode.currentIndex() != 0:
+            self.cmb_vision_mode.setCurrentIndex(0)
+            self.apply_vision_params()
+        self.resume_calibration_frame()
+        self.log("已请求 M=0 原始图；等待标定预览更新后点击定格。")
+
+    def freeze_calibration_frame(self):
+        if self.last_frame is None:
+            QMessageBox.warning(self, "标定", "没有可定格的相机画面。")
             return
-        img = self.worker.take_latest_frame()
-        if img is not None:
-            self.on_frame(img)
+        if self.cmb_vision_mode.currentIndex() != 0:
+            QMessageBox.warning(self, "标定", "请先点击“请求原始画靪 M=0”，等待新画面后再定格。")
+            return
+        self.calibration_frozen_frame = self.last_frame.copy()
+        self.calibration_points.clear()
+        self.lbl_calib_frame.setText(f"已定格 {self.last_frame.shape[1]}x{self.last_frame.shape[0]}")
+        self._refresh_calibration_preview()
+
+    def resume_calibration_frame(self):
+        self.calibration_frozen_frame = None
+        self.calibration_points.clear()
+        self.lbl_calib_frame.setText("实时画面（未定格）")
+        self._refresh_calibration_preview()
+
+    def undo_calibration_point(self):
+        if self.calibration_points:
+            self.calibration_points.pop()
+            self._refresh_calibration_preview()
+
+    def clear_calibration_points(self):
+        self.calibration_points.clear()
+        self._refresh_calibration_preview()
+
+    def _set_calibration_mode(self, mode: str):
+        self.calibration_mode = mode
+        self.calibration_points.clear()
+        message = "黑线模式：请依次点远端、近端黑线中心。" if mode == "line" else "平地模式：请依次点 A→B→C→D→E→F。"
+        self.lbl_line_status.setText(message) if mode == "line" else self.lbl_ground_status.setText(message)
+        self._refresh_calibration_preview()
+
+    def _calibration_guide_rows(self):
+        top, bottom = self.spin_roi_y1.value(), self.spin_roi_y2.value()
+        height = max(1, bottom - top)
+        # The far point must be above the default lookahead row (112), so the
+        # reference is interpolated rather than extrapolated at the target.
+        return int(round(top + 0.25 * height)), int(round(top + 0.80 * height))
+
+    def _on_calibration_image_clicked(self, x: float, y: float):
+        if self.calibration_frozen_frame is None:
+            QMessageBox.information(self, "标定", "请先定格画面，再进行手动点选。")
+            return
+        required = 2 if self.calibration_mode == "line" else 6
+        if len(self.calibration_points) >= required:
+            return
+        if self.calibration_mode == "line":
+            far_y, near_y = self._calibration_guide_rows()
+            expected_y = far_y if not self.calibration_points else near_y
+            if abs(y - expected_y) > 14:
+                QMessageBox.warning(self, "黑线零点", f"请点击距离当前辅助线 14 像素以内的黑线中心（y={expected_y}）。")
+                return
+            y = float(expected_y)
+        self.calibration_points.append((float(x), float(y)))
+        if self.calibration_mode == "line":
+            names = ("远端", "近端")
+            self.lbl_line_status.setText(f"已选 {names[len(self.calibration_points)-1]} {x:.1f}, {y:.1f}。")
+        else:
+            names = "ABCDEF"
+            self.lbl_ground_status.setText(f"已选 {names[len(self.calibration_points)-1]} {x:.1f}, {y:.1f}。")
+        self._refresh_calibration_preview()
+
+    def _refresh_calibration_preview(self):
+        image = self.calibration_frozen_frame if self.calibration_frozen_frame is not None else self.last_frame
+        if image is None or not hasattr(self, "calib_preview"):
+            return
+        annotated = image.copy()
+        if self.calibration_frozen_frame is not None:
+            cv2.putText(annotated, "FROZEN", (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            if self.calibration_mode == "line":
+                far_y, near_y = self._calibration_guide_rows()
+                for name, row in (("FAR", far_y), ("NEAR", near_y)):
+                    cv2.line(annotated, (0, row), (annotated.shape[1] - 1, row), (0, 220, 220), 1)
+                    cv2.putText(annotated, name, (5, max(14, row - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 220, 220), 1)
+        labels = ("远", "近") if self.calibration_mode == "line" else tuple("ABCDEF")
+        for index, point in enumerate(self.calibration_points):
+            px, py = int(round(point[0])), int(round(point[1]))
+            cv2.circle(annotated, (px, py), 5, (0, 0, 255), -1)
+            cv2.putText(annotated, labels[index], (px + 7, py - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        if len(self.calibration_points) >= 2 and self.calibration_mode == "line":
+            cv2.line(annotated, tuple(map(lambda a: int(round(a)), self.calibration_points[0])),
+                     tuple(map(lambda a: int(round(a)), self.calibration_points[1])), (0, 255, 0), 2)
+        self.calib_preview.set_source_size(annotated.shape[1], annotated.shape[0])
+        self._show_image(annotated, self.calib_preview)
+
+    def export_calibration_pattern(self):
+        image = render_checkerboard(self.calib_cols.value(), self.calib_rows.value())
+        default = str(Path(__file__).resolve().parent / "calibration" / "checkerboard.png")
+        path, _ = QFileDialog.getSaveFileName(self, "导出棋盘图案", default, "PNG 图片 (*.png)")
+        if not path:
+            return
+        if cv2.imwrite(path, image):
+            self.log("已导出棋盘图。请在手机/平板全屏显示，并用直尺测量一个格子的实际边长后填入本页。")
+        else:
+            QMessageBox.critical(self, "标定", "棋盘图保存失败。")
+
+    def capture_intrinsic_sample(self):
+        image = self._raw_calibration_frame()
+        if image is None:
+            return
+        corners = find_corners(image, self.calib_cols.value(), self.calib_rows.value())
+        if corners is None:
+            self.lbl_intrinsic_status.setText("未识别到完整棋盘：请保证图案清晰、完整并避免反光。")
+            return
+        self.intrinsic_samples.append(image)
+        self.lbl_intrinsic_status.setText(
+            f"已接受 {len(self.intrinsic_samples)} 张；请覆盖画面中心、四角和不同倾角，至少 20 张。")
+
+    def solve_intrinsic_calibration(self):
+        try:
+            result = solve_intrinsics(self.intrinsic_samples, self.calib_cols.value(),
+                                      self.calib_rows.value(), self.calib_square_mm.value())
+        except ValueError as exc:
+            QMessageBox.warning(self, "内参标定", str(exc))
+            return
+        self.intrinsic_result = result
+        root = Path(__file__).resolve().parents[1]
+        save_intrinsic_result(
+            root / "tools" / "calibration" / "output" / "intrinsic_calibration.json", result)
+        message = (f"内参完成：重投影误差 {result.reprojection_error_px:.3f} px，"
+                   f"分辨率 {result.image_size[0]}x{result.image_size[1]}。")
+        if result.reprojection_error_px > 1.0:
+            message += " 超过 1 px，不会允许生成固件标定头文件；请补充更分散的样本。"
+        self.lbl_intrinsic_status.setText(message + " 已保存到 intrinsic_calibration.json。")
+        self.log(message + " 内参已保存；关闭上位机不会丢失。")
+
+    def _restore_intrinsic_calibration(self):
+        path = Path(__file__).resolve().parents[1] / "tools" / "calibration" / "output" / "intrinsic_calibration.json"
+        if not path.exists():
+            return
+        try:
+            self.intrinsic_result = load_intrinsic_result(path)
+            result = self.intrinsic_result
+            self.lbl_intrinsic_status.setText(
+                f"已恢复保存的内参：{result.image_size[0]}x{result.image_size[1]}，"
+                f"重投影误差 {result.reprojection_error_px:.3f} px。")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.log(f"[ERROR] 无法读取保存的内参：{exc}")
+
+    def _restore_track_alignment(self):
+        path = Path(__file__).resolve().parents[1] / "tools" / "calibration" / "output" / "track_alignment.json"
+        if not path.exists():
+            return
+        try:
+            self.track_alignment = load_track_alignment(path)
+            result = self.track_alignment
+            self.spin_align_ke.setValue(result.gain_lateral)
+            self.spin_align_kh.setValue(result.gain_heading)
+            self.lbl_line_status.setText(
+                f"已恢复黑线零点：x={result.x_zero:.1f}px，θ={result.theta_zero_deg:.2f}°，"
+                f"{result.image_size[0]}x{result.image_size[1]}。")
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.log(f"[ERROR] 无法读取保存的黑线零点：{exc}")
+
+    def save_manual_track_alignment(self):
+        if self.intrinsic_result is None or self.intrinsic_result.reprojection_error_px > 1.0:
+            QMessageBox.warning(self, "黑线零点", "请先完成且通过 1 px 内参校验。")
+            return
+        if self.calibration_mode != "line" or len(self.calibration_points) != 2 or self.calibration_frozen_frame is None:
+            QMessageBox.warning(self, "黑线零点", "请定格后依次选择远端、近端两点。")
+            return
+        far, near = self.calibration_points
+        if near[1] <= far[1] + 5:
+            QMessageBox.warning(self, "黑线零点", "近端点必须位于远端点下方。")
+            return
+        lookahead = self.spin_lookahead_y.value()
+        x_zero = far[0] + (near[0] - far[0]) * (lookahead - far[1]) / (near[1] - far[1])
+        theta_zero = np.degrees(np.arctan2(near[0] - far[0], near[1] - far[1]))
+        frame = self.calibration_frozen_frame
+        self.track_alignment = TrackAlignment((frame.shape[1], frame.shape[0]), self.spin_roi_y1.value(),
+                                              self.spin_roi_y2.value(), lookahead, x_zero, theta_zero,
+                                              self.spin_align_ke.value(), self.spin_align_kh.value(), 0.08)
+        root = Path(__file__).resolve().parents[1]
+        output = root / "tools" / "calibration" / "output"
+        save_track_alignment(output / "track_alignment.json", self.track_alignment)
+        try:
+            write_cpp_header(root / "include" / "config" / "vision_calibration.h", self.intrinsic_result, self.track_alignment)
+        except ValueError as exc:
+            QMessageBox.warning(self, "黑线零点", str(exc)); return
+        self.lbl_line_status.setText(f"已保存：x_zero={x_zero:.2f}px，theta_zero={theta_zero:.2f}°。请重新编译烧录相机。")
+        self.log("已保存 track_alignment.json 并生成 include/config/vision_calibration.h。")
+
+    def solve_manual_flat_validation(self):
+        if self.intrinsic_result is None or self.intrinsic_result.reprojection_error_px > 1.0:
+            QMessageBox.warning(self, "平地验证", "请先完成且通过 1 px 内参校验。"); return
+        if self.calibration_mode != "flat" or len(self.calibration_points) != 6:
+            QMessageBox.warning(self, "平地验证", "请定格后依次选择 A→B→C→D→E→F 六个内角点。"); return
+        try:
+            h, errors = solve_manual_flat_plane(np.asarray(self.calibration_points[:4]), np.asarray(self.calibration_points[4:]),
+                                                self.intrinsic_result, self.calib_cols.value(), self.calib_rows.value(),
+                                                self.calib_square_mm.value(), self.ground_x.value(), self.ground_y.value())
+        except (ValueError, cv2.error) as exc:
+            QMessageBox.warning(self, "平地验证", str(exc)); return
+        root = Path(__file__).resolve().parents[1]
+        save_flat_validation(root / "tools" / "calibration" / "output" / "flat_plane_validation.json",
+                             self.intrinsic_result, h, errors, self.calib_cols.value(), self.calib_rows.value(),
+                             self.calib_square_mm.value(), self.ground_x.value(), self.ground_y.value())
+        self.lbl_ground_status.setText(f"E/F 验证误差：{errors[0]*1000:.1f} / {errors[1]*1000:.1f} mm（仅保存验证，不参与循迹）。")
+        self.log("已保存 flat_plane_validation.json；它不会更改相机循迹固件配置。")
+
+    def _queue_worker_frame(self, source, img: np.ndarray):
+        if source is self.worker:
+            self._pending_display_frame = img
+
+    def _on_worker_fps(self, source, fps: float):
+        if source is self.worker:
+            self.on_fps(fps)
+
+    def _on_worker_info(self, source, text: str):
+        if source is self.worker:
+            self.log(text)
+
+    def _on_worker_error(self, source, text: str):
+        if source is self.worker:
+            self.on_error(text)
+
+    def _on_worker_udp_stats(self, source, text: str):
+        if source is self.worker:
+            self.on_udp_stats(text)
+
+    def _render_latest_display_frame(self):
+        if isinstance(self.worker, UdpStreamWorker):
+            image = self.worker.take_latest_frame()
+            if image is not None:
+                self._pending_display_frame = image
+        image = self._pending_display_frame
+        self._pending_display_frame = None
+        if image is not None:
+            self._render_frame(image)
+
+    def on_udp_latest_frame(self):
+        # Kept for compatibility with older signal connections.
+        self._render_latest_display_frame()
 
     def on_frame(self, img: np.ndarray):
+        """Compatibility entry point: queue rather than rendering in a worker signal."""
+        self._pending_display_frame = img
+
+    def _render_frame(self, img: np.ndarray):
         self.last_frame = img
         self.lbl_resolution.setText(f"Resolution: {img.shape[1]}x{img.shape[0]}")
         self.lbl_frame_size.setText(f"Frame size: {img.nbytes // 1024} KB")
 
-        # 实时画面：显示 ESP32 回传的画面（原图 或 C++ 处理后的效果）
-        self._show_image(img, self.live_label)
+        if hasattr(self, "calib_preview") and self.calibration_frozen_frame is None:
+            self._refresh_calibration_preview()
 
-        # 算法处理页：同样显示该画面，并叠加文字说明
-        mode_name = self.cmb_vision_mode.currentText()
-        annotated = img.copy()
-        cv2.putText(
-            annotated,
-            f"Mode: {mode_name}",
-            (10, 30),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (0, 255, 0),
-            2,
-        )
-        self._show_image(annotated, self.proc_label)
+        # Rendering only the visible image tab halves conversion/scaling load.
+        if self.tabs.currentWidget() is self.proc_tab:
+            annotated = img.copy()
+            cv2.putText(annotated, f"Mode: {self.cmb_vision_mode.currentText()}",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            self._show_image(annotated, self.proc_label)
+        elif self.tabs.currentWidget() is self.live_tab:
+            self._show_image(img, self.live_label)
 
     def on_fps(self, fps: float):
         self.lbl_fps.setText(f"FPS: {fps:.1f}")

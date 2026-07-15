@@ -16,6 +16,7 @@ enum class WifiCommandKind : uint8_t
   Reset,
   Drive,
   Turn,
+  Track,
 };
 
 struct WifiTuningCommand
@@ -77,6 +78,13 @@ struct WifiTelemetry
   float maximumPitchOffsetDegrees = 0.0F;
   float headingDegrees = 0.0F;
   float yawRateDegreesPerSecond = 0.0F;
+  bool visionTrackingEnabled = false;
+  bool visionSampleFresh = false;
+  bool visionCommandAccepted = false;
+  float visionDeltaSpeedMps = 0.0F;
+  uint16_t visionTargetUpdatePeriodMs = 0;
+  bool visionTargetFilterEnabled = false;
+  uint16_t visionTargetMaximumStepMmps = 0;
 };
 
 // Wi-Fi transport only: it has no knowledge of motors, arming, or control laws.

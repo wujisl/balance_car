@@ -130,16 +130,16 @@ namespace balance_car::config
       .rightDirectionInverted = false,
   };
 
-constexpr EncoderConfiguration kEncoderConfiguration = {
+  constexpr EncoderConfiguration kEncoderConfiguration = {
       // Measured with the current A-phase CHANGE interrupt counting method.
       .countsPerWheelRevolution = 530.0F,
       .wheelDiameterMeters = 0.064F,
-    .useInternalPullups = true,
-    .leftDirectionInverted = false,
-    // The right encoder is mirror-mounted.  Invert it so both wheels report
-    // the same sign when the vehicle moves forward.
-    .rightDirectionInverted = true,
-};
+      .useInternalPullups = true,
+      .leftDirectionInverted = false,
+      // The right encoder is mirror-mounted.  Invert it so both wheels report
+      // the same sign when the vehicle moves forward.
+      .rightDirectionInverted = true,
+  };
 
   constexpr ImuConfiguration kImuConfiguration = {
       .i2cFrequencyHz = 400000,
@@ -183,7 +183,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 5,
       // Initial mechanical-balance trim measured on the assembled vehicle.
       .targetPitchDegrees = -2.09F,
-      .proportionalGain = 0.12F,
+      .proportionalGain = 0.09F,
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
@@ -197,7 +197,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 40,
       // Vehicle-tested P-only starting point. Refine from this point with
       // small increments after confirming encoder direction.
-      .proportionalGain = 11.0F,
+      .proportionalGain = 13.0F,
       .integralGain = 0.0F,
       .integralLimit = 2.0F,
       .maximumPitchOffsetDegrees = 6.0F,
@@ -209,9 +209,9 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       // At zero measured differential speed this retains the former
       // turn-command-to-motor-command scale, while encoder feedback removes
       // left/right motor and surface mismatch.
-      .proportionalGain = 1.0F,
-      .integralGain = 0.0F,
-      .integralLimit = 0.30F,
+      .proportionalGain = 1.00F,
+      .integralGain = 0.01F,
+      .integralLimit = 0.20F,
       .maximumTurnMotorCommand = 0.20F,
       .measurementFilterAlpha = 0.30F,
       .outputInverted = false,

@@ -57,6 +57,8 @@ namespace
   balance_car::app::OfflineArmControl offlineArmControl(
       balance_car::config::kBalanceArmButtonPin, balance_car::config::kSafetyConfiguration.offlineArmHoldMs);
   balance_car::app::WifiDebugServer wifiDebugServer(balance_car::config::kWifiDebugConfiguration);
+  TwoWire visionWire(1);
+  balance_car::drivers::VisionI2cClient visionI2cClient(visionWire, balance_car::config::kVisionI2cPins);
 
   class DebugConsole final : public Stream
   {
@@ -106,11 +108,44 @@ namespace
   float latestBalanceMotorCommand = 0.0F;
   float latestVelocityPitchOffsetDegrees = 0.0F;
   float latestTurnMotorCommand = 0.0F;
+  bool visionTrackingEnabled = false;
+  bool visionCommandAccepted = false;
+  bool visionCommandTransportHeld = false;
+  float lastVisionDifferentialTargetMps = 0.0F;
+  uint32_t lastVisionCommandMs = 0;
+  // Keep the I2C state exchange fast (50 Hz), but do not let every camera
+  // result replace a differential-speed step before the turn loop settles.
+  // Apply a new filtered target every 400 ms by default. I2C state exchange
+  // remains at 50 Hz and continues feeding the weighted sample window.
+  constexpr uint32_t kDefaultVisionTargetUpdatePeriodMs = 400U;
+  constexpr uint8_t kVisionTargetWindowSize = 5U;
+  uint32_t visionTargetUpdatePeriodMs = kDefaultVisionTargetUpdatePeriodMs;
+  bool visionTargetFilterEnabled = true;
+  uint16_t visionTargetMaximumStepMmps = 0;  // 0 means no slew limit.
+  float filteredVisionDifferentialTargetMps = 0.0F;
+  bool visionTargetFilterInitialized = false;
+  float visionTargetWindowMps[kVisionTargetWindowSize] = {};
+  uint8_t visionTargetWindowCount = 0U;
+  uint16_t lastVisionBufferedSampleSequence = 0;
+  uint32_t lastVisionTargetUpdateMs = 0;
+  // When a confirmed curve leaves the short camera view, keep the maximum
+  // differential-speed target in the last reliable direction. A newly valid
+  // line releases the hold immediately.
+  bool visionCurveHoldTestEnabled = true;
+  uint16_t visionCurveHoldTargetMmps = 120;
+  bool visionCurveHoldLatched = false;
+  float visionCurveHoldLatchedMps = 0.0F;
+  int8_t visionCurveCandidateSign = 0;
+  uint8_t visionCurveCandidateCount = 0;
+  uint16_t lastVisionCurveDetectionSequence = 0;
   float wifiDriveRequestedSpeedMps = 0.0F;
   bool wifiDriveSlewActive = false;
   uint32_t lastControlUpdateMs = 0;
   uint32_t lastVelocityUpdateMs = 0;
   uint32_t lastTelemetryMs = 0;
+  uint32_t lastVisionI2cMs = 0;
+  uint16_t visionChassisSequence = 0;
+  balance_car::drivers::VisionSample latestVisionSample = {};
   balance_car::app::SafetyState lastReportedSafetyState = balance_car::app::SafetyState::Boot;
   char serialCommandBuffer[kSerialCommandCapacity] = {};
   size_t serialCommandLength = 0;
@@ -207,6 +242,14 @@ namespace
       differentialOdometry.reset();
       airborneLandingManager.reset();
       motionCommand.clear();
+      visionCommandAccepted = false;
+      visionCommandTransportHeld = false;
+      lastVisionDifferentialTargetMps = 0.0F;
+      lastVisionCommandMs = 0;
+      lastVisionBufferedSampleSequence = 0;
+      lastVisionTargetUpdateMs = 0;
+      filteredVisionDifferentialTargetMps = 0.0F;
+      visionTargetFilterInitialized = false;
       motionCommand.setTargetSpeedMps(balance_car::config::kMotionConfiguration.initialTargetSpeedMps);
       wifiDriveRequestedSpeedMps = 0.0F;
       wifiDriveSlewActive = false;
@@ -230,6 +273,14 @@ namespace
     differentialOdometry.reset();
     airborneLandingManager.reset();
     motionCommand.clear();
+    visionCommandAccepted = false;
+    visionCommandTransportHeld = false;
+    lastVisionDifferentialTargetMps = 0.0F;
+    lastVisionCommandMs = 0;
+    lastVisionBufferedSampleSequence = 0;
+    lastVisionTargetUpdateMs = 0;
+    filteredVisionDifferentialTargetMps = 0.0F;
+    visionTargetFilterInitialized = false;
     wifiDriveRequestedSpeedMps = 0.0F;
     wifiDriveSlewActive = false;
     latestBalanceMotorCommand = 0.0F;
@@ -655,6 +706,38 @@ namespace
       else
         return false;
     }
+    else if (strcmp(command.domain, "vision") == 0)
+    {
+      if (strcmp(command.parameter, "period_ms") == 0)
+        visionTargetUpdatePeriodMs = static_cast<uint32_t>(
+            constrain(lroundf(command.value), 100L, 5000L));
+      else if (strcmp(command.parameter, "filter") == 0)
+      {
+        visionTargetFilterEnabled = command.value >= 0.5F;
+        filteredVisionDifferentialTargetMps = 0.0F;
+        visionTargetFilterInitialized = false;
+        visionTargetWindowCount = 0U;
+      }
+      else if (strcmp(command.parameter, "max_step_mmps") == 0)
+        visionTargetMaximumStepMmps = static_cast<uint16_t>(
+            constrain(lroundf(command.value), 0L, 200L));
+      else if (strcmp(command.parameter, "curve_hold") == 0)
+      {
+        visionCurveHoldTestEnabled = command.value >= 0.5F;
+        if (!visionCurveHoldTestEnabled)
+        {
+          visionCurveHoldLatched = false;
+          visionCurveHoldLatchedMps = 0.0F;
+          visionCurveCandidateSign = 0;
+          visionCurveCandidateCount = 0;
+        }
+      }
+      else if (strcmp(command.parameter, "curve_hold_mmps") == 0)
+        visionCurveHoldTargetMmps = static_cast<uint16_t>(
+            constrain(lroundf(command.value), 20L, 200L));
+      else
+        return false;
+    }
     else
     {
       return false;
@@ -688,6 +771,26 @@ namespace
       if (strcmp(command.parameter, "kp") == 0) return turnTuning.proportionalGain;
       if (strcmp(command.parameter, "ki") == 0) return turnTuning.integralGain;
       if (strcmp(command.parameter, "max") == 0) return turnTuning.maximumTurnMotorCommand;
+    }
+    if (strcmp(command.domain, "vision") == 0 && strcmp(command.parameter, "period_ms") == 0)
+    {
+      return static_cast<float>(visionTargetUpdatePeriodMs);
+    }
+    if (strcmp(command.domain, "vision") == 0 && strcmp(command.parameter, "filter") == 0)
+    {
+      return visionTargetFilterEnabled ? 1.0F : 0.0F;
+    }
+    if (strcmp(command.domain, "vision") == 0 && strcmp(command.parameter, "max_step_mmps") == 0)
+    {
+      return static_cast<float>(visionTargetMaximumStepMmps);
+    }
+    if (strcmp(command.domain, "vision") == 0 && strcmp(command.parameter, "curve_hold") == 0)
+    {
+      return visionCurveHoldTestEnabled ? 1.0F : 0.0F;
+    }
+    if (strcmp(command.domain, "vision") == 0 && strcmp(command.parameter, "curve_hold_mmps") == 0)
+    {
+      return static_cast<float>(visionCurveHoldTargetMmps);
     }
     return 0.0F;
   }
@@ -731,12 +834,58 @@ namespace
       {
         if (safetyManager.isBalancing())
         {
+          visionTrackingEnabled = false;
+          visionCommandAccepted = false;
+          visionCommandTransportHeld = false;
+          lastVisionDifferentialTargetMps = 0.0F;
+          lastVisionCommandMs = 0;
+          lastVisionBufferedSampleSequence = 0;
+          lastVisionTargetUpdateMs = 0;
+          filteredVisionDifferentialTargetMps = 0.0F;
+          visionTargetFilterInitialized = false;
+          visionCurveHoldLatched = false;
+          visionCurveHoldLatchedMps = 0.0F;
+          visionCurveCandidateSign = 0;
+          visionCurveCandidateCount = 0;
+          lastVisionCurveDetectionSequence = 0;
+          differentialSpeedController.reset();
           motionCommand.setTargetDifferentialSpeedMps(command.value);
           wifiDebugServer.sendCommandResult(command.requestSequence, true, "TURN_ACCEPTED");
         }
         else
         {
           wifiDebugServer.sendCommandResult(command.requestSequence, false, "NOT_BALANCING");
+        }
+      }
+      else if (command.kind == balance_car::app::WifiCommandKind::Track)
+      {
+        if (command.value >= 0.5F && !safetyManager.isBalancing())
+        {
+          wifiDebugServer.sendCommandResult(command.requestSequence, false, "NOT_BALANCING");
+        }
+        else
+        {
+          visionTrackingEnabled = command.value >= 0.5F;
+          visionCommandAccepted = false;
+          visionCommandTransportHeld = false;
+          lastVisionDifferentialTargetMps = 0.0F;
+          lastVisionCommandMs = 0;
+          lastVisionBufferedSampleSequence = 0;
+          lastVisionTargetUpdateMs = 0;
+          filteredVisionDifferentialTargetMps = 0.0F;
+          visionTargetFilterInitialized = false;
+          visionCurveHoldLatched = false;
+          visionCurveHoldLatchedMps = 0.0F;
+          visionCurveCandidateSign = 0;
+          visionCurveCandidateCount = 0;
+          lastVisionCurveDetectionSequence = 0;
+          // A previous track/manual turn must not leave its filtered speed or
+          // integral term active after the steering ownership changes.
+          differentialSpeedController.reset();
+          motionCommand.setTargetDifferentialSpeedMps(0.0F);
+          Serial.printf("[TRACK] TRACKING=%s (WIFI)\n", visionTrackingEnabled ? "ON" : "OFF");
+          wifiDebugServer.sendCommandResult(command.requestSequence, true,
+                                            visionTrackingEnabled ? "TRACKING_ON" : "TRACKING_OFF");
         }
       }
       else
@@ -813,6 +962,13 @@ namespace
     telemetry.maximumPitchOffsetDegrees = velocityTuning.maximumPitchOffsetDegrees;
     telemetry.headingDegrees = differentialOdometry.state().headingDegrees;
     telemetry.yawRateDegreesPerSecond = differentialOdometry.state().yawRateDegreesPerSecond;
+    telemetry.visionTrackingEnabled = visionTrackingEnabled;
+    telemetry.visionSampleFresh = visionI2cClient.isFresh();
+    telemetry.visionCommandAccepted = visionCommandAccepted;
+    telemetry.visionDeltaSpeedMps = latestVisionSample.deltaSpeedTargetMmps / 1000.0F;
+    telemetry.visionTargetUpdatePeriodMs = static_cast<uint16_t>(visionTargetUpdatePeriodMs);
+    telemetry.visionTargetFilterEnabled = visionTargetFilterEnabled;
+    telemetry.visionTargetMaximumStepMmps = visionTargetMaximumStepMmps;
     wifiDebugServer.publish(telemetry, nowMs);
   }
 
@@ -845,6 +1001,188 @@ namespace
         motionCommand.targetDifferentialSpeedMps(), latestWheelSpeed.leftMetersPerSecond,
         latestWheelSpeed.rightMetersPerSecond, static_cast<float>(elapsedMs) / 1000.0F);
     differentialOdometry.update(latestWheelSpeed, static_cast<float>(elapsedMs) / 1000.0F);
+  }
+
+  // I2C v2 is a transport boundary: it sends measured wheel speeds to the
+  // camera and accepts only the camera's right-minus-left speed setpoint.
+  void updateVisionI2c(uint32_t nowMs)
+  {
+    if (nowMs - lastVisionI2cMs < 20U) return;
+    lastVisionI2cMs = nowMs;
+    balance_car::drivers::VisionChassisState state = {};
+    state.sequence = ++visionChassisSequence;
+    state.balancing = safetyManager.isBalancing();
+    state.trackingEnabled = state.balancing && visionTrackingEnabled;
+    state.wheelSpeedValid = encoderDriver.isInitialized();
+    state.leftSpeedMmps = static_cast<int16_t>(constrain(lroundf(latestWheelSpeed.leftMetersPerSecond * 1000.0F), -32768L, 32767L));
+    state.rightSpeedMmps = static_cast<int16_t>(constrain(lroundf(latestWheelSpeed.rightMetersPerSecond * 1000.0F), -32768L, 32767L));
+    state.forwardTargetMmps = static_cast<int16_t>(constrain(lroundf(motionCommand.targetSpeedMps() * 1000.0F), -32768L, 32767L));
+    state.timestampMs = nowMs;
+    const bool exchanged = visionI2cClient.exchange(state, latestVisionSample);
+    const bool usable = exchanged && latestVisionSample.trackValid && latestVisionSample.calibrated &&
+                        latestVisionSample.qualityOk && !latestVisionSample.held;
+    // This is the single hand-off from vision transport to the existing
+    // differential-speed loop. A one-off I2C transaction failure should not
+    // produce a 20 ms zero-steering notch. An explicit invalid/held camera
+    // frame may enter the configured last-direction maximum-turn hold below.
+    const bool controlEnabled = visionTrackingEnabled && state.balancing;
+    const bool directAccepted = controlEnabled && usable;
+    if (!controlEnabled)
+    {
+      visionCurveHoldLatched = false;
+      visionCurveHoldLatchedMps = 0.0F;
+      visionCurveCandidateSign = 0;
+      visionCurveCandidateCount = 0;
+    }
+    // A genuinely valid line has returned. Release loss hold immediately and
+    // allow this sample to bypass the normal 400 ms target-update gate.
+    if (directAccepted && visionCurveHoldLatched)
+    {
+      visionCurveHoldLatched = false;
+      visionCurveHoldLatchedMps = 0.0F;
+      lastVisionTargetUpdateMs = 0U;
+      filteredVisionDifferentialTargetMps = 0.0F;
+      visionTargetFilterInitialized = false;
+      visionTargetWindowCount = 0U;
+    }
+    if (directAccepted)
+    {
+      lastVisionCommandMs = nowMs;
+      const bool newCameraSample = latestVisionSample.sequence != lastVisionBufferedSampleSequence;
+      const bool updateDue = lastVisionTargetUpdateMs == 0U ||
+                             nowMs - lastVisionTargetUpdateMs >= visionTargetUpdatePeriodMs;
+      if (newCameraSample)
+      {
+        const float requestedMps = latestVisionSample.deltaSpeedTargetMmps / 1000.0F;
+        if (!visionTargetFilterInitialized)
+        {
+          visionTargetWindowCount = 0U;
+          visionTargetFilterInitialized = true;
+        }
+        if (visionTargetWindowCount < kVisionTargetWindowSize)
+        {
+          visionTargetWindowMps[visionTargetWindowCount++] = requestedMps;
+        }
+        else
+        {
+          for (uint8_t i = 1U; i < kVisionTargetWindowSize; ++i)
+          {
+            visionTargetWindowMps[i - 1U] = visionTargetWindowMps[i];
+          }
+          visionTargetWindowMps[kVisionTargetWindowSize - 1U] = requestedMps;
+        }
+        lastVisionBufferedSampleSequence = latestVisionSample.sequence;
+
+        if (updateDue)
+        {
+          if (visionTargetFilterEnabled)
+          {
+            float weightedSum = 0.0F;
+            float weightSum = 0.0F;
+            for (uint8_t i = 0U; i < visionTargetWindowCount; ++i)
+            {
+              const float weight = static_cast<float>(i + 1U);
+              weightedSum += visionTargetWindowMps[i] * weight;
+              weightSum += weight;
+            }
+            filteredVisionDifferentialTargetMps = weightSum > 0.0F
+                ? weightedSum / weightSum
+                : requestedMps;
+          }
+          else
+          {
+            filteredVisionDifferentialTargetMps = requestedMps;
+          }
+
+          const float desiredMps = filteredVisionDifferentialTargetMps;
+          if (visionTargetMaximumStepMmps == 0U)
+          {
+            lastVisionDifferentialTargetMps = desiredMps;
+          }
+          else
+          {
+            const float maximumStepMps = visionTargetMaximumStepMmps / 1000.0F;
+            const float increment = constrain(desiredMps - lastVisionDifferentialTargetMps,
+                                              -maximumStepMps, maximumStepMps);
+            lastVisionDifferentialTargetMps += increment;
+          }
+          lastVisionTargetUpdateMs = nowMs;
+        }
+      }
+    }
+    // Remember a direction only after two fresh, same-direction valid frames.
+    // Two near-zero valid frames clear the previous curve direction.
+    if (directAccepted &&
+        latestVisionSample.sequence != lastVisionCurveDetectionSequence)
+    {
+      lastVisionCurveDetectionSequence = latestVisionSample.sequence;
+      const int16_t cameraDeltaMmps = latestVisionSample.deltaSpeedTargetMmps;
+      if (abs(cameraDeltaMmps) >= 8)
+      {
+        const int8_t sign = cameraDeltaMmps > 0 ? 1 : -1;
+        if (sign == visionCurveCandidateSign)
+        {
+          if (visionCurveCandidateCount < 2) visionCurveCandidateCount++;
+        }
+        else
+        {
+          visionCurveCandidateSign = sign;
+          visionCurveCandidateCount = 1;
+        }
+      }
+      else
+      {
+        if (visionCurveCandidateCount > 0) visionCurveCandidateCount--;
+        if (visionCurveCandidateCount == 0) visionCurveCandidateSign = 0;
+      }
+    }
+    const bool cameraReportedLost = controlEnabled && exchanged && !usable;
+    if (cameraReportedLost)
+    {
+      filteredVisionDifferentialTargetMps = 0.0F;
+      visionTargetFilterInitialized = false;
+      visionTargetWindowCount = 0U;
+    }
+    if (visionCurveHoldTestEnabled && cameraReportedLost &&
+        !visionCurveHoldLatched && visionCurveCandidateCount >= 2 &&
+        visionCurveCandidateSign != 0)
+    {
+      visionCurveHoldLatched = true;
+      visionCurveHoldLatchedMps = visionCurveCandidateSign *
+                                  (visionCurveHoldTargetMmps / 1000.0F);
+    }
+    visionCommandTransportHeld = controlEnabled && !exchanged && lastVisionCommandMs != 0U &&
+                                nowMs - lastVisionCommandMs <= 120U;
+    visionCommandAccepted = directAccepted || visionCommandTransportHeld ||
+                            (controlEnabled && visionCurveHoldTestEnabled && visionCurveHoldLatched);
+    if (visionTrackingEnabled)
+    {
+      const float appliedVisionTargetMps =
+          (visionCurveHoldTestEnabled && visionCurveHoldLatched)
+              ? visionCurveHoldLatchedMps
+              : lastVisionDifferentialTargetMps;
+      motionCommand.setTargetDifferentialSpeedMps(
+          visionCommandAccepted ? appliedVisionTargetMps : 0.0F);
+    }
+    static uint32_t lastPrintMs = 0;
+    if (nowMs - lastPrintMs >= 100U)
+    {
+      lastPrintMs = nowMs;
+      const float averageSpeedMps = 0.5F * (latestWheelSpeed.leftMetersPerSecond +
+                                            latestWheelSpeed.rightMetersPerSecond);
+      // Keep this line below the Wi-Fi console buffer capacity.  It is the
+      // complete, intentionally small CSV source for tracking diagnosis.
+      Serial.printf("[I2C] valid=%u dv=%d cmd_dv=%d vl=%.3f vr=%.3f measured_dv=%d vavg=%.3f vtarget=%.3f\n",
+                    latestVisionSample.trackValid ? 1U : 0U,
+                    latestVisionSample.deltaSpeedTargetMmps,
+                    static_cast<int>(lroundf(motionCommand.targetDifferentialSpeedMps() * 1000.0F)),
+                    latestWheelSpeed.leftMetersPerSecond,
+                    latestWheelSpeed.rightMetersPerSecond,
+                    static_cast<int>(lroundf((latestWheelSpeed.rightMetersPerSecond -
+                                              latestWheelSpeed.leftMetersPerSecond) * 1000.0F)),
+                    averageSpeedMps,
+                    motionCommand.targetSpeedMps());
+    }
   }
 
   void updateBalanceControl(uint32_t nowMs)
@@ -961,6 +1299,8 @@ void setup()
   balance_car::app::SelfTest::printReport(Serial, report);
   safetyManager.completeSelfTest(report);
   wifiDebugServer.begin();
+  Serial.println(visionI2cClient.begin() ? "[I2C-INIT] vision v2 master ready"
+                                         : "[I2C-INIT] vision v2 master init failed");
   printStatus();
   printHelp();
 }
@@ -973,6 +1313,7 @@ void loop()
   safetyManager.update(nowMs);
   processOfflineArmControl(nowMs);
   updateVelocityControl(nowMs);
+  updateVisionI2c(nowMs);
   updateBalanceControl(nowMs);
   reportSafetyFaultTransition();
   printTelemetry(nowMs);
