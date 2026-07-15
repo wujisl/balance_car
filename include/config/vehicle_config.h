@@ -93,6 +93,25 @@ namespace balance_car::config
     bool outputInverted;
   };
 
+  // A manually selected profile for a known uphill section.  It supplements
+  // the normal velocity loop with a gradually applied pitch feed-forward and
+  // a bounded integral correction.  Keep it disabled until the configured
+  // direction and limits have been verified on a supported, low-speed test.
+  struct ClimbModeConfiguration
+  {
+    float forwardPitchFeedforwardDegrees;
+    float pitchFeedforwardSlewRateDegreesPerSecond;
+    float speedIntegralGain;
+    float maximumIntegralPitchDegrees;
+    float integralUnwindRateDegreesPerSecond;
+    float maximumPitchOffsetDegrees;
+    float maximumMotorCommand;
+    float maximumTargetSpeedMps;
+    float maximumDifferentialSpeedMps;
+    float maximumTurnMotorCommand;
+    bool outputInverted;
+  };
+
   // Controls the wheel-speed difference used for steering. A positive target
   // means that the right wheel should move faster than the left wheel.
   struct DifferentialSpeedConfiguration
@@ -183,7 +202,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 5,
       // Initial mechanical-balance trim measured on the assembled vehicle.
       .targetPitchDegrees = -2.09F,
-      .proportionalGain = 0.12F,
+      .proportionalGain = 0.09F,
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
@@ -197,11 +216,28 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 40,
       // Vehicle-tested P-only starting point. Refine from this point with
       // small increments after confirming encoder direction.
-      .proportionalGain = 11.0F,
+      .proportionalGain = 13.0F,
       .integralGain = 0.0F,
       .integralLimit = 2.0F,
       .maximumPitchOffsetDegrees = 6.0F,
       .measurementFilterAlpha = 0.3F,
+      .outputInverted = false,
+  };
+
+  constexpr ClimbModeConfiguration kClimbModeConfiguration = {
+      // Initial 15-degree-ramp profile.  These are conservative starting
+      // values, not a certified torque specification; tune on a restrained
+      // low-speed test while watching motor output and speed error.
+      .forwardPitchFeedforwardDegrees = 2.0F,
+      .pitchFeedforwardSlewRateDegreesPerSecond = 3.0F,
+      .speedIntegralGain = 4.0F,
+      .maximumIntegralPitchDegrees = 5.0F,
+      .integralUnwindRateDegreesPerSecond = 3.0F,
+      .maximumPitchOffsetDegrees = 9.0F,
+      .maximumMotorCommand = 0.60F,
+      .maximumTargetSpeedMps = 1.50F,
+      .maximumDifferentialSpeedMps = 0.04F,
+      .maximumTurnMotorCommand = 0.06F,
       .outputInverted = false,
   };
 
@@ -225,8 +261,8 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
   };
 
   constexpr MotionConfiguration kMotionConfiguration = {
-      .maximumTargetSpeedMps = 0.25F,
-      .initialTargetSpeedMps = 0.06F,
+      .maximumTargetSpeedMps = 1.50F,
+      .initialTargetSpeedMps = 0.05F,
       .targetSpeedStepMps = 0.05F,
       // Target right-minus-left wheel speed for differential steering, in m/s.
       .maximumTurnCommand = 0.20F,

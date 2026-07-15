@@ -23,9 +23,14 @@ bool isAllowedParameter(const char *domain, const char *parameter)
           (strcmp(domain, "speed") == 0 &&
            (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
             strcmp(parameter, "max_pitch") == 0)) ||
-          (strcmp(domain, "turn") == 0 &&
-           (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
-            strcmp(parameter, "max") == 0));
+           (strcmp(domain, "turn") == 0 &&
+            (strcmp(parameter, "kp") == 0 || strcmp(parameter, "ki") == 0 ||
+             strcmp(parameter, "max") == 0)) ||
+           (strcmp(domain, "climb") == 0 &&
+            (strcmp(parameter, "ff") == 0 || strcmp(parameter, "ki") == 0 ||
+             strcmp(parameter, "max_pitch") == 0 || strcmp(parameter, "max_motor") == 0 ||
+             strcmp(parameter, "max_speed") == 0 || strcmp(parameter, "max_turn") == 0 ||
+             strcmp(parameter, "invert") == 0));
 }
 
 void toLowercase(char *text)
@@ -412,6 +417,31 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       }
       _pendingCommand.kind = WifiCommandKind::Turn;
       _pendingCommand.value = turn;
+    }
+    else if (strcmp(action, "climb") == 0)
+    {
+      char *stateText = strtok_r(nullptr, ",", &context);
+      if (stateText == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      toLowercase(stateText);
+      if (strcmp(stateText, "on") == 0)
+      {
+        _pendingCommand.kind = WifiCommandKind::ClimbMode;
+        _pendingCommand.value = 1.0F;
+      }
+      else if (strcmp(stateText, "off") == 0)
+      {
+        _pendingCommand.kind = WifiCommandKind::ClimbMode;
+        _pendingCommand.value = 0.0F;
+      }
+      else
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_CLIMB_STATE");
+        return false;
+      }
     }
     else
     {

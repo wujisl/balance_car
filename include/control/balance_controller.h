@@ -31,7 +31,8 @@ public:
   explicit BalanceController(const config::BalanceConfiguration &configuration);
 
   void reset();
-  float update(const AttitudeState &attitude, float velocityPitchOffsetDegrees);
+  float update(const AttitudeState &attitude, float velocityPitchOffsetDegrees,
+               float maximumMotorCommandOverride = -1.0F);
   void setProportionalGain(float gain);
   void setIntegralGain(float gain);
   void setDerivativeGain(float gain);

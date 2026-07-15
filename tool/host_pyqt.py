@@ -982,6 +982,7 @@ class MainWindow(QMainWindow):
         self.balance_command_sequence = 0
         self.balance_pending_tuning = {}
         self.balance_pending_sequences = {}
+        self.balance_pending_controls = {}
         self.balance_tuning_loaded = False
         self.balance_last_received_monotonic = None
         self.balance_last_telemetry_sequence = None
@@ -1043,7 +1044,7 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(QLabel("前进 / 后退速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
-        self.spin_balance_drive_speed.setRange(-0.250, 0.250)
+        self.spin_balance_drive_speed.setRange(-1.500, 1.500)
         self.spin_balance_drive_speed.setSingleStep(0.010)
         self.spin_balance_drive_speed.setValue(0.0)
         self.spin_balance_drive_speed.setEnabled(False)
@@ -1128,6 +1129,21 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(self.btn_route_cancel, 6, 6)
         self.lbl_route_status = QLabel("路线未运行")
         connection_grid.addWidget(self.lbl_route_status, 7, 0, 1, 8)
+
+        connection_grid.addWidget(QLabel("上坡模式:"), 8, 0, 1, 2)
+        self.btn_climb_enable = QPushButton("启用上坡模式")
+        self.btn_climb_enable.setToolTip("仅在 BALANCING 状态下下发；小车会逐步叠加上坡补偿")
+        self.btn_climb_enable.clicked.connect(lambda: self.request_climb_mode(True))
+        self.btn_climb_enable.setEnabled(False)
+        connection_grid.addWidget(self.btn_climb_enable, 8, 2, 1, 2)
+        self.btn_climb_disable = QPushButton("退出上坡模式")
+        self.btn_climb_disable.setToolTip("小车会平滑撤除上坡前馈和积分补偿")
+        self.btn_climb_disable.clicked.connect(lambda: self.request_climb_mode(False))
+        self.btn_climb_disable.setEnabled(False)
+        connection_grid.addWidget(self.btn_climb_disable, 8, 4, 1, 2)
+        self.lbl_climb_mode_status = QLabel("未启用")
+        self.lbl_climb_mode_status.setStyleSheet("color: #666;")
+        connection_grid.addWidget(self.lbl_climb_mode_status, 8, 6, 1, 2)
         layout.addWidget(connection_group)
 
         live_group = QGroupBox("实时状态")
@@ -1204,6 +1220,51 @@ class MainWindow(QMainWindow):
         tuning_grid.addWidget(self.btn_apply_balance_tuning, 4, 3, 1, 3)
         layout.addWidget(tuning_group)
 
+        climb_group = QGroupBox("上坡模式参数（通过 Wi-Fi 在线下发）")
+        climb_grid = QGridLayout(climb_group)
+        self.climb_tuning_controls = {}
+        climb_fields = [
+            ("climb_ff", "上坡前馈俯仰 (°)", 2.0, 3, -15.0, 15.0, 0.1,
+             "上坡方向的基础俯仰补偿；方向错误时应先在低速、有人扶持条件下调整符号。"),
+            ("climb_ki", "上坡速度积分 Ki", 4.0, 4, 0.0, 100.0, 0.1,
+             "只在上坡模式下使用，用于补偿持续速度误差。"),
+            ("climb_max_pitch", "最大总俯仰偏置 (°)", 9.0, 2, 0.0, 15.0, 0.1,
+             "普通速度环输出、上坡前馈和上坡积分之和的限幅。"),
+            ("climb_max_motor", "最大共同电机输出 (0–1)", 0.60, 3, 0.0, 1.0, 0.01,
+             "启用上坡模式后的电机上限；提高前请确认电池、驱动和电机温度。"),
+            ("climb_max_speed", "最大上坡目标速度 (m/s)", 0.12, 3, 0.0, 1.50, 0.01,
+             "上坡模式会把更高的前进目标速度限制到此值。"),
+            ("climb_max_turn", "最大上坡转向输出 (0–1)", 0.06, 3, 0.0, 1.0, 0.01,
+             "上坡时给转向保留的最大电机输出；较小值优先保证共同驱动力。"),
+        ]
+        for index, (key, title, value, decimals, minimum, maximum, step, tooltip) in enumerate(climb_fields):
+            row, column = divmod(index, 2)
+            climb_grid.addWidget(QLabel(title + ":"), row, column * 2)
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setRange(minimum, maximum)
+            spin.setSingleStep(step)
+            spin.setValue(value)
+            spin.setMinimumWidth(150)
+            spin.setToolTip(tooltip)
+            self.climb_tuning_controls[key] = spin
+            climb_grid.addWidget(spin, row, column * 2 + 1)
+
+        self.chk_climb_invert = QCheckBox("上坡积分方向反转")
+        self.chk_climb_invert.setToolTip("仅当启用上坡模式后速度误差的积分补偿方向确认相反时使用。")
+        self.climb_tuning_controls["climb_invert"] = self.chk_climb_invert
+        climb_grid.addWidget(self.chk_climb_invert, 3, 0, 1, 2)
+        climb_grid.addWidget(
+            QLabel("可在线调节：前馈、Ki、俯仰/电机/速度/转向限幅和积分方向；其余上坡参数保持固件默认值。"),
+            3, 2, 1, 2
+        )
+        self.btn_apply_climb_tuning = QPushButton("应用上坡模式参数")
+        self.btn_apply_climb_tuning.setToolTip("参数可在普通模式下预先下发；只有启用上坡模式后才参与控制。")
+        self.btn_apply_climb_tuning.clicked.connect(self.apply_climb_tuning)
+        self.btn_apply_climb_tuning.setEnabled(False)
+        climb_grid.addWidget(self.btn_apply_climb_tuning, 4, 0, 1, 4)
+        layout.addWidget(climb_group)
+
         console_group = QGroupBox("主板串口日志镜像")
         console_layout = QVBoxLayout(console_group)
         self.balance_console_log = QTextEdit()
@@ -1279,6 +1340,7 @@ class MainWindow(QMainWindow):
         self.balance_tuning_loaded = False
         self.btn_apply_balance_loop_tuning.setEnabled(False)
         self.btn_apply_balance_tuning.setEnabled(False)
+        self.btn_apply_climb_tuning.setEnabled(False)
         self.btn_balance_stop.setEnabled(True)
         self.btn_balance_reset.setEnabled(True)
         self.btn_balance_arm.setEnabled(False)
@@ -1297,6 +1359,10 @@ class MainWindow(QMainWindow):
         self.btn_balance_left.setEnabled(False)
         self.btn_balance_right.setEnabled(False)
         self.btn_balance_motion_stop.setEnabled(False)
+        self.btn_climb_enable.setEnabled(False)
+        self.btn_climb_disable.setEnabled(False)
+        self.lbl_climb_mode_status.setText("未启用")
+        self.lbl_climb_mode_status.setStyleSheet("color: #666;")
         self.btn_route_start.setEnabled(False)
         self.btn_route_cancel.setEnabled(False)
         self.balance_ip_edit.setEnabled(False)
@@ -1313,6 +1379,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "balance_pending_tuning"):
             self.balance_pending_tuning.clear()
             self.balance_pending_sequences.clear()
+            self.balance_pending_controls.clear()
         self.balance_tuning_loaded = False
         self.balance_last_telemetry_sequence = None
         self.balance_last_board_timestamp_ms = None
@@ -1324,6 +1391,7 @@ class MainWindow(QMainWindow):
             self.btn_balance_disconnect.setEnabled(False)
             self.btn_apply_balance_loop_tuning.setEnabled(False)
             self.btn_apply_balance_tuning.setEnabled(False)
+            self.btn_apply_climb_tuning.setEnabled(False)
             self.btn_balance_arm.setEnabled(False)
             self.btn_balance_stop.setEnabled(False)
             self.btn_balance_reset.setEnabled(False)
@@ -1338,6 +1406,10 @@ class MainWindow(QMainWindow):
             self.btn_balance_left.setEnabled(False)
             self.btn_balance_right.setEnabled(False)
             self.btn_balance_motion_stop.setEnabled(False)
+            self.btn_climb_enable.setEnabled(False)
+            self.btn_climb_disable.setEnabled(False)
+            self.lbl_climb_mode_status.setText("未连接")
+            self.lbl_climb_mode_status.setStyleSheet("color: #666;")
             self.cancel_route(send_stop=False)
             self.btn_route_start.setEnabled(False)
             self.balance_ip_edit.setEnabled(True)
@@ -1456,15 +1528,46 @@ class MainWindow(QMainWindow):
             command_fields, "已发送平衡环参数：Kp、Ki、Kd、Trim、最大电机输出；速度环参数未改动"
         )
 
+    def apply_climb_tuning(self):
+        command_fields = [
+            ("climb", "ff", "climb_ff"),
+            ("climb", "ki", "climb_ki"),
+            ("climb", "max_pitch", "climb_max_pitch"),
+            ("climb", "max_motor", "climb_max_motor"),
+            ("climb", "max_speed", "climb_max_speed"),
+            ("climb", "max_turn", "climb_max_turn"),
+            ("climb", "invert", "climb_invert"),
+        ]
+        self._send_tuning_commands(
+            command_fields, "已发送上坡模式参数，等待主板 ACK 确认；参数将在启用上坡模式后生效"
+        )
+
+    def _tuning_control_value(self, key: str) -> float:
+        control = self.balance_tuning_spins.get(key)
+        if control is None:
+            control = self.climb_tuning_controls[key]
+        return 1.0 if isinstance(control, QCheckBox) and control.isChecked() else \
+            (0.0 if isinstance(control, QCheckBox) else control.value())
+
+    def _set_tuning_control_value(self, key: str, value: float):
+        control = self.balance_tuning_spins.get(key)
+        if control is None:
+            control = self.climb_tuning_controls[key]
+        if isinstance(control, QCheckBox):
+            control.setChecked(value >= 0.5)
+        else:
+            control.setValue(value)
+
     def _send_tuning_commands(self, command_fields, success_message: str):
         if self.balance_worker is None or not self.balance_tuning_loaded:
             self.log("请先连接主板并等待首次参数遥测完成")
             return
         self.btn_apply_balance_loop_tuning.setEnabled(False)
         self.btn_apply_balance_tuning.setEnabled(False)
+        self.btn_apply_climb_tuning.setEnabled(False)
         for domain, parameter, key in command_fields:
             self.balance_command_sequence += 1
-            value = self.balance_tuning_spins[key].value()
+            value = self._tuning_control_value(key)
             self.balance_pending_tuning[key] = value
             self.balance_pending_sequences[self.balance_command_sequence] = {
                 "key": key, "domain": domain, "parameter": parameter, "value": value,
@@ -1492,6 +1595,8 @@ class MainWindow(QMainWindow):
             return
         self.cancel_route(send_stop=False)
         self._send_balance_control("STOP")
+        self.lbl_climb_mode_status.setText("停止平衡后，上坡模式已由主板清除")
+        self.lbl_climb_mode_status.setStyleSheet("color: #666;")
 
     def request_board_reset(self):
         if self.balance_worker is None:
@@ -1503,6 +1608,8 @@ class MainWindow(QMainWindow):
         )
         if answer == QMessageBox.Yes:
             self._send_balance_control("RESET")
+            self.lbl_climb_mode_status.setText("主板重启中；上坡模式将清除")
+            self.lbl_climb_mode_status.setStyleSheet("color: #666;")
 
     def start_route(self):
         if self.balance_worker is None:
@@ -1639,6 +1746,19 @@ class MainWindow(QMainWindow):
         self._send_balance_control("TURN", 0.0)
         self._send_balance_control("DRIVE", 0.0)
 
+    def request_climb_mode(self, enabled: bool):
+        if self.balance_worker is None:
+            self.log("请先连接主板 Wi-Fi 调试端口")
+            return
+        state_text = "on" if enabled else "off"
+        expected_reply = "CLIMB_ON" if enabled else "CLIMB_OFF"
+        self._send_balance_control(
+            "CLIMB", state_text,
+            pending_control={"kind": "climb", "enabled": enabled, "expected_reply": expected_reply}
+        )
+        self.lbl_climb_mode_status.setText("正在请求启用上坡模式..." if enabled else "正在请求退出上坡模式...")
+        self.lbl_climb_mode_status.setStyleSheet("color: #b36b00;")
+
     def request_balance_turn_speed(self):
         if self.balance_worker is None:
             self.log("请先连接主板 Wi-Fi 调试端口")
@@ -1655,14 +1775,17 @@ class MainWindow(QMainWindow):
         self.spin_balance_turn_speed.setValue(0.0)
         self._send_balance_control("TURN", 0.0)
 
-    def _send_balance_control(self, action: str, value: float = None):
+    def _send_balance_control(self, action: str, value=None, pending_control=None):
         self.balance_command_sequence += 1
-        command = f"C,{self.balance_command_sequence},{action}"
+        sequence = self.balance_command_sequence
+        command = f"C,{sequence},{action}"
         if value is not None:
-            command += f",{value:.3f}"
+            command += f",{value}" if isinstance(value, str) else f",{value:.3f}"
         command += "\n"
+        if pending_control is not None:
+            self.balance_pending_controls[sequence] = pending_control
         self.balance_worker.queue_command(command.encode("ascii"))
-        suffix = "" if value is None else f" {value:.3f} m/s"
+        suffix = "" if value is None else (f" {value}" if isinstance(value, str) else f" {value:.3f} m/s")
         self.log(f"已发送主板控制命令：{action}{suffix}")
 
     def on_balance_telemetry(self, telemetry: dict):
@@ -1684,6 +1807,7 @@ class MainWindow(QMainWindow):
             self.log("检测到主板重启，已重新开始接收遥测序号")
             self.balance_pending_tuning.clear()
             self.balance_pending_sequences.clear()
+            self.balance_pending_controls.clear()
 
         self.balance_last_telemetry_sequence = sequence
         self.balance_last_board_timestamp_ms = board_timestamp_ms
@@ -1743,6 +1867,7 @@ class MainWindow(QMainWindow):
             self.balance_tuning_loaded = True
             self.btn_apply_balance_loop_tuning.setEnabled(True)
             self.btn_apply_balance_tuning.setEnabled(True)
+            self.btn_apply_climb_tuning.setEnabled(True)
             self.log("已从主板读取当前 PID / PI 参数；现在可安全下发修改")
 
         self.lbl_balance_link.setText("已收到主板遥测")
@@ -1764,6 +1889,8 @@ class MainWindow(QMainWindow):
         self.btn_balance_left.setEnabled(turn_enabled)
         self.btn_balance_right.setEnabled(turn_enabled)
         self.btn_balance_motion_stop.setEnabled(drive_enabled)
+        self.btn_climb_enable.setEnabled(drive_enabled)
+        self.btn_climb_disable.setEnabled(drive_enabled)
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
         self._update_balance_packet_age(sequence)
@@ -1776,6 +1903,17 @@ class MainWindow(QMainWindow):
         try:
             sequence = int(fields[1])
         except ValueError:
+            return
+        pending_control = self.balance_pending_controls.pop(sequence, None)
+        if pending_control is not None:
+            if fields[2] == "OK" and fields[3] == pending_control["expected_reply"]:
+                enabled = pending_control["enabled"]
+                self.lbl_climb_mode_status.setText("已启用（主板 ACK 确认）" if enabled else "已退出（主板 ACK 确认）")
+                self.lbl_climb_mode_status.setStyleSheet("color: #16803c;" if enabled else "color: #666;")
+            else:
+                self.lbl_climb_mode_status.setText(f"上坡模式命令被拒绝：{fields[3]}")
+                self.lbl_climb_mode_status.setStyleSheet("color: #c62828;")
+                self.log(f"[ERROR] 上坡模式控制失败：{fields[3]}")
             return
         pending = self.balance_pending_sequences.pop(sequence, None)
         if pending is None:
@@ -1803,11 +1941,17 @@ class MainWindow(QMainWindow):
             return
 
         self.balance_pending_tuning.pop(key, None)
-        self.balance_tuning_spins[key].setValue(actual_value)
+        self._set_tuning_control_value(key, actual_value)
         self.log(f"参数已由主板 ACK 确认：{key}={actual_value:.5f}")
         self._finish_tuning_transaction()
 
     def on_balance_command_failed(self, sequence: int, reason: str):
+        pending_control = self.balance_pending_controls.pop(sequence, None)
+        if pending_control is not None:
+            self.lbl_climb_mode_status.setText(f"上坡模式命令超时：{reason}")
+            self.lbl_climb_mode_status.setStyleSheet("color: #c62828;")
+            self.log(f"[ERROR] 上坡模式控制命令超时：{reason}")
+            return
         pending = self.balance_pending_sequences.pop(sequence, None)
         if pending is not None:
             self.balance_pending_tuning.pop(pending["key"], None)
@@ -1819,6 +1963,7 @@ class MainWindow(QMainWindow):
             return
         self.btn_apply_balance_loop_tuning.setEnabled(self.balance_tuning_loaded)
         self.btn_apply_balance_tuning.setEnabled(self.balance_tuning_loaded)
+        self.btn_apply_climb_tuning.setEnabled(self.balance_tuning_loaded)
 
     def on_balance_console_line(self, line: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]

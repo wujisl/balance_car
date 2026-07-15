@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "app/airborne_landing_manager.h"
+#include "app/climb_mode_manager.h"
 #include "app/offline_arm_control.h"
 #include "app/safety_manager.h"
 #include "app/self_test.h"
@@ -54,6 +55,8 @@ namespace
       motorDriver, balance_car::config::kSafetyConfiguration);
   balance_car::app::AirborneLandingManager airborneLandingManager(
       balance_car::config::kAirborneLandingConfiguration);
+  balance_car::app::ClimbModeManager climbModeManager(
+      balance_car::config::kClimbModeConfiguration);
   balance_car::app::OfflineArmControl offlineArmControl(
       balance_car::config::kBalanceArmButtonPin, balance_car::config::kSafetyConfiguration.offlineArmHoldMs);
   balance_car::app::WifiDebugServer wifiDebugServer(balance_car::config::kWifiDebugConfiguration);
@@ -106,6 +109,9 @@ namespace
   float latestBalanceMotorCommand = 0.0F;
   float latestVelocityPitchOffsetDegrees = 0.0F;
   float latestTurnMotorCommand = 0.0F;
+  balance_car::app::ClimbModeOutput latestClimbModeOutput = {};
+  float latestEffectiveTargetSpeedMps = 0.0F;
+  float latestEffectiveDifferentialSpeedMps = 0.0F;
   float wifiDriveRequestedSpeedMps = 0.0F;
   bool wifiDriveSlewActive = false;
   uint32_t lastControlUpdateMs = 0;
@@ -123,6 +129,8 @@ namespace
     Serial.println("[CMD] set speed kp|ki|target|invert <value>");
     Serial.println("[CMD] set turn kp|ki|max|invert <value>");
     Serial.println("[CMD] set motion speed|turn <value>");
+    Serial.println("[CMD] climb on|off (manual mode; no automatic slope detection)");
+    Serial.println("[CMD] set climb ff|ki|max_pitch|max_motor|max_speed|max_turn|invert <value>");
     Serial.println("[CMD] Hold BOOT for 1.5 seconds in STANDBY to arm offline balance; press BOOT while balancing to stop.");
   }
 
@@ -140,11 +148,11 @@ namespace
     Serial.print(" PITCH=");
     Serial.print(latestAttitude.pitchDegrees, 2);
     Serial.print(" TARGET_SPEED=");
-    Serial.print(motionCommand.targetSpeedMps(), 3);
+    Serial.print(latestEffectiveTargetSpeedMps, 3);
     Serial.print(" FILTERED_SPEED=");
     Serial.print(velocityState.filteredSpeedMps, 3);
     Serial.print(" TARGET_DIFF_SPEED=");
-    Serial.print(motionCommand.targetDifferentialSpeedMps(), 3);
+    Serial.print(latestEffectiveDifferentialSpeedMps, 3);
     Serial.print(" FILTERED_DIFF_SPEED=");
     Serial.print(turnState.filteredDifferentialSpeedMps, 3);
     Serial.print(" TURN_OUTPUT=");
@@ -177,6 +185,21 @@ namespace
     Serial.print(turnTuning.integralGain, 3);
     Serial.print(" MAX_TURN_OUTPUT=");
     Serial.println(turnTuning.maximumTurnMotorCommand, 3);
+    const balance_car::app::ClimbModeTuning climbTuning = climbModeManager.tuning();
+    Serial.print("[CLIMB] REQUESTED=");
+    Serial.print(climbModeManager.isRequested() ? 1 : 0);
+    Serial.print(" STATE=");
+    Serial.print(balance_car::app::ClimbModeManager::stateName(climbModeManager.state()));
+    Serial.print(" FF=");
+    Serial.print(latestClimbModeOutput.feedforwardPitchDegrees, 3);
+    Serial.print(" I=");
+    Serial.print(latestClimbModeOutput.integralPitchDegrees, 3);
+    Serial.print(" OFFSET=");
+    Serial.print(latestClimbModeOutput.pitchOffsetDegrees, 3);
+    Serial.print(" MAX_MOTOR=");
+    Serial.print(climbTuning.maximumMotorCommand, 3);
+    Serial.print(" MAX_SPEED=");
+    Serial.println(climbTuning.maximumTargetSpeedMps, 3);
   }
 
   void printMotionCommand()
@@ -206,6 +229,7 @@ namespace
       differentialSpeedController.reset();
       differentialOdometry.reset();
       airborneLandingManager.reset();
+      climbModeManager.reset();
       motionCommand.clear();
       motionCommand.setTargetSpeedMps(balance_car::config::kMotionConfiguration.initialTargetSpeedMps);
       wifiDriveRequestedSpeedMps = 0.0F;
@@ -213,6 +237,9 @@ namespace
       latestBalanceMotorCommand = 0.0F;
       latestVelocityPitchOffsetDegrees = 0.0F;
       latestTurnMotorCommand = 0.0F;
+      latestClimbModeOutput = {};
+      latestEffectiveTargetSpeedMps = 0.0F;
+      latestEffectiveDifferentialSpeedMps = 0.0F;
       Serial.print("[BALANCE] STATE=ACTIVE INITIAL_TARGET_SPEED_MPS=");
       Serial.println(motionCommand.targetSpeedMps(), 3);
       return true;
@@ -229,12 +256,16 @@ namespace
     differentialSpeedController.reset();
     differentialOdometry.reset();
     airborneLandingManager.reset();
+    climbModeManager.reset();
     motionCommand.clear();
     wifiDriveRequestedSpeedMps = 0.0F;
     wifiDriveSlewActive = false;
     latestBalanceMotorCommand = 0.0F;
     latestVelocityPitchOffsetDegrees = 0.0F;
     latestTurnMotorCommand = 0.0F;
+    latestClimbModeOutput = {};
+    latestEffectiveTargetSpeedMps = 0.0F;
+    latestEffectiveDifferentialSpeedMps = 0.0F;
     latestMixedMotorCommand = {};
   }
 
@@ -242,6 +273,19 @@ namespace
   {
     wifiDriveRequestedSpeedMps = 0.0F;
     wifiDriveSlewActive = false;
+  }
+
+  bool requestClimbMode(bool enabled)
+  {
+    if (enabled && !safetyManager.isBalancing())
+    {
+      return false;
+    }
+
+    climbModeManager.setEnabled(enabled);
+    Serial.print("[CLIMB] REQUESTED=");
+    Serial.println(enabled ? "ON" : "OFF");
+    return true;
   }
 
   void handleAirborneLandingEvent(balance_car::app::AirborneLandingEvent event)
@@ -257,6 +301,7 @@ namespace
       balanceController.reset();
       velocityController.reset();
       differentialSpeedController.reset();
+      climbModeManager.reset();
       latestBalanceMotorCommand = 0.0F;
       latestVelocityPitchOffsetDegrees = 0.0F;
       latestTurnMotorCommand = 0.0F;
@@ -272,8 +317,10 @@ namespace
       velocityController.reset();
       differentialSpeedController.reset();
       differentialOdometry.reset();
+      climbModeManager.reset();
       latestVelocityPitchOffsetDegrees = 0.0F;
       latestTurnMotorCommand = 0.0F;
+      latestClimbModeOutput = {};
       Serial.println("[LANDING] STATE=RECOVERING; attitude reset, motor output ramping");
       break;
 
@@ -435,6 +482,42 @@ namespace
         return;
       }
     }
+    else if (strcmp(domain, "climb") == 0)
+    {
+      if (strcmp(parameter, "ff") == 0)
+      {
+        climbModeManager.setForwardPitchFeedforwardDegrees(value);
+      }
+      else if (strcmp(parameter, "ki") == 0)
+      {
+        climbModeManager.setSpeedIntegralGain(value);
+      }
+      else if (strcmp(parameter, "max_pitch") == 0)
+      {
+        climbModeManager.setMaximumPitchOffsetDegrees(value);
+      }
+      else if (strcmp(parameter, "max_motor") == 0)
+      {
+        climbModeManager.setMaximumMotorCommand(value);
+      }
+      else if (strcmp(parameter, "max_speed") == 0)
+      {
+        climbModeManager.setMaximumTargetSpeedMps(value);
+      }
+      else if (strcmp(parameter, "max_turn") == 0)
+      {
+        climbModeManager.setMaximumTurnMotorCommand(value);
+      }
+      else if (strcmp(parameter, "invert") == 0)
+      {
+        climbModeManager.setOutputInverted(value >= 0.5F);
+      }
+      else
+      {
+        Serial.println("[CMD] UNKNOWN_CLIMB_PARAMETER");
+        return;
+      }
+    }
     else if (strcmp(domain, "motion") == 0)
     {
       if (strcmp(parameter, "speed") == 0)
@@ -567,6 +650,19 @@ namespace
       Serial.println("[DIAG] MOTOR_OUTPUT=STOPPED");
       return;
     }
+    if (strcmp(commandLine, "climb on") == 0)
+    {
+      if (!requestClimbMode(true))
+      {
+        Serial.println("[CLIMB] REJECTED=NOT_BALANCING");
+      }
+      return;
+    }
+    if (strcmp(commandLine, "climb off") == 0)
+    {
+      requestClimbMode(false);
+      return;
+    }
 
     char domain[16] = {};
     char parameter[16] = {};
@@ -655,6 +751,25 @@ namespace
       else
         return false;
     }
+    else if (strcmp(command.domain, "climb") == 0)
+    {
+      if (strcmp(command.parameter, "ff") == 0)
+        climbModeManager.setForwardPitchFeedforwardDegrees(command.value);
+      else if (strcmp(command.parameter, "ki") == 0)
+        climbModeManager.setSpeedIntegralGain(command.value);
+      else if (strcmp(command.parameter, "max_pitch") == 0)
+        climbModeManager.setMaximumPitchOffsetDegrees(command.value);
+      else if (strcmp(command.parameter, "max_motor") == 0)
+        climbModeManager.setMaximumMotorCommand(command.value);
+      else if (strcmp(command.parameter, "max_speed") == 0)
+        climbModeManager.setMaximumTargetSpeedMps(command.value);
+      else if (strcmp(command.parameter, "max_turn") == 0)
+        climbModeManager.setMaximumTurnMotorCommand(command.value);
+      else if (strcmp(command.parameter, "invert") == 0)
+        climbModeManager.setOutputInverted(command.value >= 0.5F);
+      else
+        return false;
+    }
     else
     {
       return false;
@@ -688,6 +803,17 @@ namespace
       if (strcmp(command.parameter, "kp") == 0) return turnTuning.proportionalGain;
       if (strcmp(command.parameter, "ki") == 0) return turnTuning.integralGain;
       if (strcmp(command.parameter, "max") == 0) return turnTuning.maximumTurnMotorCommand;
+    }
+    const balance_car::app::ClimbModeTuning climbTuning = climbModeManager.tuning();
+    if (strcmp(command.domain, "climb") == 0)
+    {
+      if (strcmp(command.parameter, "ff") == 0) return climbTuning.forwardPitchFeedforwardDegrees;
+      if (strcmp(command.parameter, "ki") == 0) return climbTuning.speedIntegralGain;
+      if (strcmp(command.parameter, "max_pitch") == 0) return climbTuning.maximumPitchOffsetDegrees;
+      if (strcmp(command.parameter, "max_motor") == 0) return climbTuning.maximumMotorCommand;
+      if (strcmp(command.parameter, "max_speed") == 0) return climbTuning.maximumTargetSpeedMps;
+      if (strcmp(command.parameter, "max_turn") == 0) return climbTuning.maximumTurnMotorCommand;
+      if (strcmp(command.parameter, "invert") == 0) return climbTuning.outputInverted ? 1.0F : 0.0F;
     }
     return 0.0F;
   }
@@ -739,6 +865,13 @@ namespace
           wifiDebugServer.sendCommandResult(command.requestSequence, false, "NOT_BALANCING");
         }
       }
+      else if (command.kind == balance_car::app::WifiCommandKind::ClimbMode)
+      {
+        const bool accepted = requestClimbMode(command.value >= 0.5F);
+        wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
+                                          accepted ? (command.value >= 0.5F ? "CLIMB_ON" : "CLIMB_OFF")
+                                                   : "NOT_BALANCING");
+      }
       else
       {
         const bool accepted = applyWifiTuningCommand(command);
@@ -779,11 +912,11 @@ namespace
     telemetry.gyroXDps = latestImuSample.gyroXDps;
     telemetry.gyroYDps = latestImuSample.gyroYDps;
     telemetry.gyroZDps = latestImuSample.gyroZDps;
-    telemetry.targetSpeedMps = motionCommand.targetSpeedMps();
+    telemetry.targetSpeedMps = latestEffectiveTargetSpeedMps;
     telemetry.filteredSpeedMps = velocityState.filteredSpeedMps;
     telemetry.speedErrorMps = velocityState.speedErrorMps;
     telemetry.speedPitchOffsetDegrees = latestVelocityPitchOffsetDegrees;
-    telemetry.turnCommand = motionCommand.targetDifferentialSpeedMps();
+    telemetry.turnCommand = latestEffectiveDifferentialSpeedMps;
     telemetry.filteredDifferentialSpeedMps = turnState.filteredDifferentialSpeedMps;
     telemetry.differentialSpeedErrorMps = turnState.differentialSpeedErrorMps;
     telemetry.turnMotorCommand = latestTurnMotorCommand;
@@ -809,8 +942,13 @@ namespace
     telemetry.turnKi = turnTuning.integralGain;
     telemetry.maximumTurnMotorCommand = turnTuning.maximumTurnMotorCommand;
     telemetry.turnInverted = turnTuning.outputInverted;
-    telemetry.maximumMotorCommand = balanceTuning.maximumMotorCommand;
-    telemetry.maximumPitchOffsetDegrees = velocityTuning.maximumPitchOffsetDegrees;
+    const balance_car::app::ClimbModeTuning climbTuning = climbModeManager.tuning();
+    telemetry.maximumMotorCommand = latestClimbModeOutput.active
+                                        ? latestClimbModeOutput.maximumMotorCommand
+                                        : balanceTuning.maximumMotorCommand;
+    telemetry.maximumPitchOffsetDegrees = latestClimbModeOutput.active
+                                              ? climbTuning.maximumPitchOffsetDegrees
+                                              : velocityTuning.maximumPitchOffsetDegrees;
     telemetry.headingDegrees = differentialOdometry.state().headingDegrees;
     telemetry.yawRateDegreesPerSecond = differentialOdometry.state().yawRateDegreesPerSecond;
     wifiDebugServer.publish(telemetry, nowMs);
@@ -831,20 +969,33 @@ namespace
       velocityController.reset();
       differentialSpeedController.reset();
       differentialOdometry.reset();
+      climbModeManager.reset();
       latestVelocityPitchOffsetDegrees = 0.0F;
       latestTurnMotorCommand = 0.0F;
+      latestClimbModeOutput = {};
+      latestEffectiveTargetSpeedMps = 0.0F;
+      latestEffectiveDifferentialSpeedMps = 0.0F;
       return;
     }
-
     const float measuredSpeedMps = 0.5F *
                                    (latestWheelSpeed.leftMetersPerSecond + latestWheelSpeed.rightMetersPerSecond);
-    updateWifiDriveTarget(static_cast<float>(elapsedMs) / 1000.0F);
-    latestVelocityPitchOffsetDegrees = velocityController.update(
-        motionCommand.targetSpeedMps(), measuredSpeedMps, static_cast<float>(elapsedMs) / 1000.0F);
+    const float deltaSeconds = static_cast<float>(elapsedMs) / 1000.0F;
+    updateWifiDriveTarget(deltaSeconds);
+    latestEffectiveTargetSpeedMps =
+        climbModeManager.limitTargetSpeedMps(motionCommand.targetSpeedMps());
+    const float normalVelocityPitchOffsetDegrees = velocityController.update(
+        latestEffectiveTargetSpeedMps, measuredSpeedMps, deltaSeconds);
+    latestClimbModeOutput = climbModeManager.update(
+        latestEffectiveTargetSpeedMps, velocityController.state().filteredSpeedMps,
+        normalVelocityPitchOffsetDegrees, deltaSeconds);
+    latestVelocityPitchOffsetDegrees = latestClimbModeOutput.pitchOffsetDegrees;
+    latestEffectiveDifferentialSpeedMps =
+        climbModeManager.limitDifferentialSpeedMps(motionCommand.targetDifferentialSpeedMps());
     latestTurnMotorCommand = differentialSpeedController.update(
-        motionCommand.targetDifferentialSpeedMps(), latestWheelSpeed.leftMetersPerSecond,
-        latestWheelSpeed.rightMetersPerSecond, static_cast<float>(elapsedMs) / 1000.0F);
-    differentialOdometry.update(latestWheelSpeed, static_cast<float>(elapsedMs) / 1000.0F);
+        latestEffectiveDifferentialSpeedMps, latestWheelSpeed.leftMetersPerSecond,
+        latestWheelSpeed.rightMetersPerSecond, deltaSeconds,
+        latestClimbModeOutput.active ? latestClimbModeOutput.maximumTurnMotorCommand : -1.0F);
+    differentialOdometry.update(latestWheelSpeed, deltaSeconds);
   }
 
   void updateBalanceControl(uint32_t nowMs)
@@ -879,10 +1030,14 @@ namespace
       return;
     }
 
-    latestBalanceMotorCommand = balanceController.update(latestAttitude, latestVelocityPitchOffsetDegrees);
+    const float maximumMotorCommand = latestClimbModeOutput.active
+                                          ? latestClimbModeOutput.maximumMotorCommand
+                                          : balanceController.tuning().maximumMotorCommand;
+    latestBalanceMotorCommand = balanceController.update(
+        latestAttitude, latestVelocityPitchOffsetDegrees, maximumMotorCommand);
     latestMixedMotorCommand = balance_car::control::MotorMixer::mix(
         latestBalanceMotorCommand, latestTurnMotorCommand,
-        balanceController.tuning().maximumMotorCommand * airborneLandingManager.motorOutputScale(nowMs));
+        maximumMotorCommand * airborneLandingManager.motorOutputScale(nowMs));
     motorDriver.setNormalized(latestMixedMotorCommand.left, latestMixedMotorCommand.right);
   }
 
@@ -915,7 +1070,7 @@ namespace
     Serial.print(',');
     Serial.print(latestImuSample.gyroZDps, 2);
     Serial.print(" target_speed_mps=");
-    Serial.print(motionCommand.targetSpeedMps(), 3);
+    Serial.print(latestEffectiveTargetSpeedMps, 3);
     Serial.print(" measured_speed_mps=");
     Serial.print(velocityState.filteredSpeedMps, 3);
     Serial.print(" speed_error_mps=");
@@ -923,7 +1078,7 @@ namespace
     Serial.print(" speed_pitch_offset_deg=");
     Serial.print(latestVelocityPitchOffsetDegrees, 3);
     Serial.print(" target_diff_speed_mps=");
-    Serial.print(motionCommand.targetDifferentialSpeedMps(), 3);
+    Serial.print(latestEffectiveDifferentialSpeedMps, 3);
     Serial.print(" measured_diff_speed_mps=");
     Serial.print(turnState.filteredDifferentialSpeedMps, 3);
     Serial.print(" turn_output_requested_applied=");
@@ -945,7 +1100,15 @@ namespace
     Serial.print(" ticks_lr=");
     Serial.print(latestWheelSpeed.leftTicks);
     Serial.print(',');
-    Serial.println(latestWheelSpeed.rightTicks);
+    Serial.print(latestWheelSpeed.rightTicks);
+    Serial.print(" climb=requested/active,ff,i=");
+    Serial.print(latestClimbModeOutput.requested ? 1 : 0);
+    Serial.print(',');
+    Serial.print(latestClimbModeOutput.active ? 1 : 0);
+    Serial.print(',');
+    Serial.print(latestClimbModeOutput.feedforwardPitchDegrees, 3);
+    Serial.print(',');
+    Serial.println(latestClimbModeOutput.integralPitchDegrees, 3);
   }
 } // namespace
 
