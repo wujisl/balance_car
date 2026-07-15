@@ -6,8 +6,17 @@ namespace balance_car::app
 {
 AirborneLandingManager::AirborneLandingManager(
     const config::AirborneLandingConfiguration &configuration)
-    : _configuration(configuration)
+    : _tuning()
 {
+  _tuning.enabled = configuration.enabled;
+  _tuning.airborneAccelerationThresholdG = configuration.airborneAccelerationThresholdG;
+  _tuning.airborneConfirmationMs = configuration.airborneConfirmationMs;
+  _tuning.maximumAirborneMs = configuration.maximumAirborneMs;
+  _tuning.landingAccelerationMinimumG = configuration.landingAccelerationMinimumG;
+  _tuning.landingAccelerationMaximumG = configuration.landingAccelerationMaximumG;
+  _tuning.landingSettleMs = configuration.landingSettleMs;
+  _tuning.landingRecoveryTimeoutMs = configuration.landingRecoveryTimeoutMs;
+  _tuning.motorRecoveryRampMs = configuration.motorRecoveryRampMs;
 }
 
 void AirborneLandingManager::reset()
@@ -22,7 +31,7 @@ void AirborneLandingManager::reset()
 
 AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sample, uint32_t nowMs)
 {
-  if (!_configuration.enabled || !sample.valid)
+  if (!_tuning.enabled || !sample.valid)
   {
     return AirborneLandingEvent::None;
   }
@@ -31,13 +40,13 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
   switch (_state)
   {
   case AirborneLandingState::Grounded:
-    if (accelerationG < _configuration.airborneAccelerationThresholdG)
+    if (accelerationG < _tuning.airborneAccelerationThresholdG)
     {
       if (_lowAccelerationStartedAtMs == 0)
       {
         _lowAccelerationStartedAtMs = nowMs;
       }
-      if (nowMs - _lowAccelerationStartedAtMs >= _configuration.airborneConfirmationMs)
+      if (nowMs - _lowAccelerationStartedAtMs >= _tuning.airborneConfirmationMs)
       {
         _state = AirborneLandingState::Airborne;
         _airborneStartedAtMs = nowMs;
@@ -52,12 +61,13 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
     break;
 
   case AirborneLandingState::Airborne:
-    if (nowMs - _airborneStartedAtMs > _configuration.maximumAirborneMs)
+    if (nowMs - _airborneStartedAtMs > _tuning.maximumAirborneMs)
     {
       _state = AirborneLandingState::Fault;
       return AirborneLandingEvent::Fault;
     }
-    if (accelerationG >= _configuration.landingAccelerationMinimumG)
+    if (accelerationG >= fminf(_tuning.landingAccelerationMinimumG,
+                                _tuning.landingAccelerationMaximumG))
     {
       _state = AirborneLandingState::LandingSettling;
       _landingDetectedAtMs = nowMs;
@@ -66,7 +76,7 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
     break;
 
   case AirborneLandingState::LandingSettling:
-    if (nowMs - _landingDetectedAtMs > _configuration.landingRecoveryTimeoutMs)
+    if (nowMs - _landingDetectedAtMs > _tuning.landingRecoveryTimeoutMs)
     {
       _state = AirborneLandingState::Fault;
       return AirborneLandingEvent::Fault;
@@ -81,7 +91,7 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
       _landingStableStartedAtMs = nowMs;
       break;
     }
-    if (nowMs - _landingStableStartedAtMs >= _configuration.landingSettleMs)
+    if (nowMs - _landingStableStartedAtMs >= _tuning.landingSettleMs)
     {
       _state = AirborneLandingState::Recovering;
       _recoveryStartedAtMs = nowMs;
@@ -90,7 +100,7 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
     break;
 
   case AirborneLandingState::Recovering:
-    if (nowMs - _recoveryStartedAtMs >= _configuration.motorRecoveryRampMs)
+    if (nowMs - _recoveryStartedAtMs >= _tuning.motorRecoveryRampMs)
     {
       _state = AirborneLandingState::Grounded;
       return AirborneLandingEvent::RecoveryComplete;
@@ -105,7 +115,7 @@ AirborneLandingEvent AirborneLandingManager::update(const drivers::ImuSample &sa
 
 bool AirborneLandingManager::isEnabled() const
 {
-  return _configuration.enabled;
+  return _tuning.enabled;
 }
 
 bool AirborneLandingManager::useAccelerometerCorrection() const
@@ -135,18 +145,69 @@ float AirborneLandingManager::motorOutputScale(uint32_t nowMs) const
   {
     return 1.0F;
   }
-  if (_state != AirborneLandingState::Recovering || _configuration.motorRecoveryRampMs == 0)
+  if (_state != AirborneLandingState::Recovering || _tuning.motorRecoveryRampMs == 0)
   {
     return 0.0F;
   }
   const float scale = static_cast<float>(nowMs - _recoveryStartedAtMs) /
-                      static_cast<float>(_configuration.motorRecoveryRampMs);
+                      static_cast<float>(_tuning.motorRecoveryRampMs);
   return scale > 1.0F ? 1.0F : scale;
 }
 
 AirborneLandingState AirborneLandingManager::state() const
 {
   return _state;
+}
+
+AirborneLandingTuning AirborneLandingManager::tuning() const
+{
+  return _tuning;
+}
+
+void AirborneLandingManager::setEnabled(bool enabled)
+{
+  _tuning.enabled = enabled;
+  reset();
+}
+
+void AirborneLandingManager::setAirborneAccelerationThresholdG(float thresholdG)
+{
+  _tuning.airborneAccelerationThresholdG = constrain(thresholdG, 0.05F, 0.95F);
+}
+
+void AirborneLandingManager::setAirborneConfirmationMs(uint16_t durationMs)
+{
+  _tuning.airborneConfirmationMs = durationMs > 100 ? 100 : durationMs;
+}
+
+void AirborneLandingManager::setMaximumAirborneMs(uint16_t durationMs)
+{
+  _tuning.maximumAirborneMs = constrain(durationMs, static_cast<uint16_t>(100), static_cast<uint16_t>(2000));
+}
+
+void AirborneLandingManager::setLandingAccelerationMinimumG(float accelerationG)
+{
+  _tuning.landingAccelerationMinimumG = constrain(accelerationG, 0.10F, 3.50F);
+}
+
+void AirborneLandingManager::setLandingAccelerationMaximumG(float accelerationG)
+{
+  _tuning.landingAccelerationMaximumG = constrain(accelerationG, 0.20F, 4.00F);
+}
+
+void AirborneLandingManager::setLandingSettleMs(uint16_t durationMs)
+{
+  _tuning.landingSettleMs = constrain(durationMs, static_cast<uint16_t>(10), static_cast<uint16_t>(500));
+}
+
+void AirborneLandingManager::setLandingRecoveryTimeoutMs(uint16_t durationMs)
+{
+  _tuning.landingRecoveryTimeoutMs = constrain(durationMs, static_cast<uint16_t>(100), static_cast<uint16_t>(3000));
+}
+
+void AirborneLandingManager::setMotorRecoveryRampMs(uint16_t durationMs)
+{
+  _tuning.motorRecoveryRampMs = durationMs > 1500 ? 1500 : durationMs;
 }
 
 const char *AirborneLandingManager::stateName(AirborneLandingState state)
@@ -170,8 +231,11 @@ const char *AirborneLandingManager::stateName(AirborneLandingState state)
 bool AirborneLandingManager::accelerationInLandingBand(const drivers::ImuSample &sample) const
 {
   const float accelerationG = accelerationMagnitudeG(sample);
-  return accelerationG >= _configuration.landingAccelerationMinimumG &&
-         accelerationG <= _configuration.landingAccelerationMaximumG;
+  const float minimumG = fminf(_tuning.landingAccelerationMinimumG,
+                               _tuning.landingAccelerationMaximumG);
+  const float maximumG = fmaxf(_tuning.landingAccelerationMinimumG,
+                               _tuning.landingAccelerationMaximumG);
+  return accelerationG >= minimumG && accelerationG <= maximumG;
 }
 
 float AirborneLandingManager::accelerationMagnitudeG(const drivers::ImuSample &sample)

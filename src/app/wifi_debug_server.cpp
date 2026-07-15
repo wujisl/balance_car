@@ -30,7 +30,12 @@ bool isAllowedParameter(const char *domain, const char *parameter)
             (strcmp(parameter, "ff") == 0 || strcmp(parameter, "ki") == 0 ||
              strcmp(parameter, "max_pitch") == 0 || strcmp(parameter, "max_motor") == 0 ||
              strcmp(parameter, "max_speed") == 0 || strcmp(parameter, "max_turn") == 0 ||
-             strcmp(parameter, "invert") == 0));
+             strcmp(parameter, "invert") == 0)) ||
+          (strcmp(domain, "landing") == 0 &&
+           (strcmp(parameter, "airborne_g") == 0 || strcmp(parameter, "confirm_ms") == 0 ||
+            strcmp(parameter, "max_airborne_ms") == 0 || strcmp(parameter, "landing_min_g") == 0 ||
+            strcmp(parameter, "landing_max_g") == 0 || strcmp(parameter, "settle_ms") == 0 ||
+            strcmp(parameter, "timeout_ms") == 0 || strcmp(parameter, "ramp_ms") == 0));
 }
 
 void toLowercase(char *text)
@@ -78,8 +83,8 @@ void WifiDebugServer::begin()
            _configuration.telemetryPort, _configuration.commandPort);
   writeConsoleBytes(reinterpret_cast<const uint8_t *>(startupLine), strlen(startupLine));
   writeConsoleByte('\n');
-  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"),
-                    strlen("[WIFI] DEBUG telemetry=T,5 fields=50 logs=L,seq,text subscription=H"));
+  writeConsoleBytes(reinterpret_cast<const uint8_t *>("[WIFI] DEBUG telemetry=T,6 fields=61 logs=L,seq,text subscription=H"),
+                    strlen("[WIFI] DEBUG telemetry=T,6 fields=61 logs=L,seq,text subscription=H"));
   writeConsoleByte('\n');
 }
 
@@ -176,7 +181,7 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   char packet[kTelemetryBufferCapacity] = {};
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,5,%lu,%lu,%u,%u,%u,"
+      "T,6,%lu,%lu,%u,%u,%u,"
       "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
       "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
       "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
@@ -194,7 +199,10 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       "%.5f,%.5f,%.5f,"         // balance P/I/D terms
       "%.5f,%u,"               // raw balance motor command, speed output inverted
       "%.5f,%.5f,%.3f,%u,"    // turn Kp/Ki/max command, output inverted
-      "%.3f,%.3f\n",          // relative heading, filtered yaw rate
+      "%.3f,%.3f,"             // relative heading, filtered yaw rate
+      "%u,%u,%.3f,"            // landing enabled, state, acceleration magnitude
+      "%.3f,%u,%u,%.3f,%.3f,"  // airborne threshold/timing, landing acceleration band
+      "%u,%u,%u\n",           // landing settle, recovery timeout, motor ramp
       static_cast<unsigned long>(_telemetrySequence++),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
@@ -218,7 +226,18 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.balanceMotorRaw, telemetry.speedInverted ? 1U : 0U,
       telemetry.turnKp, telemetry.turnKi, telemetry.maximumTurnMotorCommand,
       telemetry.turnInverted ? 1U : 0U,
-      telemetry.headingDegrees, telemetry.yawRateDegreesPerSecond);
+      telemetry.headingDegrees, telemetry.yawRateDegreesPerSecond,
+      telemetry.airborneLandingEnabled ? 1U : 0U,
+      static_cast<unsigned int>(telemetry.airborneLandingState),
+      telemetry.accelerationMagnitudeG,
+      telemetry.airborneAccelerationThresholdG,
+      static_cast<unsigned int>(telemetry.airborneConfirmationMs),
+      static_cast<unsigned int>(telemetry.maximumAirborneMs),
+      telemetry.landingAccelerationMinimumG,
+      telemetry.landingAccelerationMaximumG,
+      static_cast<unsigned int>(telemetry.landingSettleMs),
+      static_cast<unsigned int>(telemetry.landingRecoveryTimeoutMs),
+      static_cast<unsigned int>(telemetry.motorRecoveryRampMs));
   if (length <= 0 || length >= static_cast<int>(sizeof(packet)))
   {
     return;
@@ -440,6 +459,31 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       else
       {
         sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_CLIMB_STATE");
+        return false;
+      }
+    }
+    else if (strcmp(action, "landing") == 0)
+    {
+      char *stateText = strtok_r(nullptr, ",", &context);
+      if (stateText == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      toLowercase(stateText);
+      if (strcmp(stateText, "on") == 0)
+      {
+        _pendingCommand.kind = WifiCommandKind::AirborneLandingMode;
+        _pendingCommand.value = 1.0F;
+      }
+      else if (strcmp(stateText, "off") == 0)
+      {
+        _pendingCommand.kind = WifiCommandKind::AirborneLandingMode;
+        _pendingCommand.value = 0.0F;
+      }
+      else
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "INVALID_LANDING_STATE");
         return false;
       }
     }

@@ -179,7 +179,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
   constexpr AirborneLandingConfiguration kAirborneLandingConfiguration = {
       // Enable only after suspended and small-height landing tests have
       // validated the vehicle's mechanical strength and IMU thresholds.
-      .enabled = false,
+      .enabled = true,
       .airborneAccelerationThresholdG = 0.35F,
       .airborneConfirmationMs = 20,
       .maximumAirborneMs = 500,

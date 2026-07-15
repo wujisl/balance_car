@@ -31,6 +31,19 @@ namespace
   constexpr size_t kSerialCommandCapacity = 96;
   constexpr float kWifiDriveSpeedSlewRateMpsPerSecond = 0.10F;
 
+  uint16_t millisecondsFromCommandValue(float value)
+  {
+    if (value <= 0.0F)
+    {
+      return 0;
+    }
+    if (value >= 65535.0F)
+    {
+      return 65535;
+    }
+    return static_cast<uint16_t>(value + 0.5F);
+  }
+
   balance_car::hal::I2cBus i2cBus(Wire);
   balance_car::drivers::MotorDriver motorDriver(
       balance_car::config::kMotorPins, balance_car::config::kMotorConfiguration);
@@ -284,6 +297,21 @@ namespace
 
     climbModeManager.setEnabled(enabled);
     Serial.print("[CLIMB] REQUESTED=");
+    Serial.println(enabled ? "ON" : "OFF");
+    return true;
+  }
+
+  bool requestAirborneLandingMode(bool enabled)
+  {
+    // Configuration must be changed before arming. Changing thresholds while
+    // airborne or recovering would make one landing use mixed criteria.
+    if (safetyManager.state() != balance_car::app::SafetyState::Standby)
+    {
+      return false;
+    }
+
+    airborneLandingManager.setEnabled(enabled);
+    Serial.print("[LANDING] PROTECTION=");
     Serial.println(enabled ? "ON" : "OFF");
     return true;
   }
@@ -770,6 +798,33 @@ namespace
       else
         return false;
     }
+    else if (strcmp(command.domain, "landing") == 0)
+    {
+      // Landing criteria are intentionally immutable during BALANCING. The
+      // operator can tune while disarmed, then arm for one controlled trial.
+      if (safetyManager.state() != balance_car::app::SafetyState::Standby)
+      {
+        return false;
+      }
+      if (strcmp(command.parameter, "airborne_g") == 0)
+        airborneLandingManager.setAirborneAccelerationThresholdG(command.value);
+      else if (strcmp(command.parameter, "confirm_ms") == 0)
+        airborneLandingManager.setAirborneConfirmationMs(millisecondsFromCommandValue(command.value));
+      else if (strcmp(command.parameter, "max_airborne_ms") == 0)
+        airborneLandingManager.setMaximumAirborneMs(millisecondsFromCommandValue(command.value));
+      else if (strcmp(command.parameter, "landing_min_g") == 0)
+        airborneLandingManager.setLandingAccelerationMinimumG(command.value);
+      else if (strcmp(command.parameter, "landing_max_g") == 0)
+        airborneLandingManager.setLandingAccelerationMaximumG(command.value);
+      else if (strcmp(command.parameter, "settle_ms") == 0)
+        airborneLandingManager.setLandingSettleMs(millisecondsFromCommandValue(command.value));
+      else if (strcmp(command.parameter, "timeout_ms") == 0)
+        airborneLandingManager.setLandingRecoveryTimeoutMs(millisecondsFromCommandValue(command.value));
+      else if (strcmp(command.parameter, "ramp_ms") == 0)
+        airborneLandingManager.setMotorRecoveryRampMs(millisecondsFromCommandValue(command.value));
+      else
+        return false;
+    }
     else
     {
       return false;
@@ -814,6 +869,18 @@ namespace
       if (strcmp(command.parameter, "max_speed") == 0) return climbTuning.maximumTargetSpeedMps;
       if (strcmp(command.parameter, "max_turn") == 0) return climbTuning.maximumTurnMotorCommand;
       if (strcmp(command.parameter, "invert") == 0) return climbTuning.outputInverted ? 1.0F : 0.0F;
+    }
+    const balance_car::app::AirborneLandingTuning landingTuning = airborneLandingManager.tuning();
+    if (strcmp(command.domain, "landing") == 0)
+    {
+      if (strcmp(command.parameter, "airborne_g") == 0) return landingTuning.airborneAccelerationThresholdG;
+      if (strcmp(command.parameter, "confirm_ms") == 0) return landingTuning.airborneConfirmationMs;
+      if (strcmp(command.parameter, "max_airborne_ms") == 0) return landingTuning.maximumAirborneMs;
+      if (strcmp(command.parameter, "landing_min_g") == 0) return landingTuning.landingAccelerationMinimumG;
+      if (strcmp(command.parameter, "landing_max_g") == 0) return landingTuning.landingAccelerationMaximumG;
+      if (strcmp(command.parameter, "settle_ms") == 0) return landingTuning.landingSettleMs;
+      if (strcmp(command.parameter, "timeout_ms") == 0) return landingTuning.landingRecoveryTimeoutMs;
+      if (strcmp(command.parameter, "ramp_ms") == 0) return landingTuning.motorRecoveryRampMs;
     }
     return 0.0F;
   }
@@ -871,6 +938,14 @@ namespace
         wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
                                           accepted ? (command.value >= 0.5F ? "CLIMB_ON" : "CLIMB_OFF")
                                                    : "NOT_BALANCING");
+      }
+      else if (command.kind == balance_car::app::WifiCommandKind::AirborneLandingMode)
+      {
+        const bool enabled = command.value >= 0.5F;
+        const bool accepted = requestAirborneLandingMode(enabled);
+        wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
+                                          accepted ? (enabled ? "LANDING_ON" : "LANDING_OFF")
+                                                   : "STANDBY_REQUIRED");
       }
       else
       {
@@ -951,6 +1026,19 @@ namespace
                                               : velocityTuning.maximumPitchOffsetDegrees;
     telemetry.headingDegrees = differentialOdometry.state().headingDegrees;
     telemetry.yawRateDegreesPerSecond = differentialOdometry.state().yawRateDegreesPerSecond;
+    telemetry.airborneLandingEnabled = airborneLandingManager.isEnabled();
+    telemetry.airborneLandingState = static_cast<uint8_t>(airborneLandingManager.state());
+    telemetry.accelerationMagnitudeG =
+        balance_car::app::AirborneLandingManager::accelerationMagnitudeG(latestImuSample);
+    const balance_car::app::AirborneLandingTuning landingTuning = airborneLandingManager.tuning();
+    telemetry.airborneAccelerationThresholdG = landingTuning.airborneAccelerationThresholdG;
+    telemetry.airborneConfirmationMs = landingTuning.airborneConfirmationMs;
+    telemetry.maximumAirborneMs = landingTuning.maximumAirborneMs;
+    telemetry.landingAccelerationMinimumG = landingTuning.landingAccelerationMinimumG;
+    telemetry.landingAccelerationMaximumG = landingTuning.landingAccelerationMaximumG;
+    telemetry.landingSettleMs = landingTuning.landingSettleMs;
+    telemetry.landingRecoveryTimeoutMs = landingTuning.landingRecoveryTimeoutMs;
+    telemetry.motorRecoveryRampMs = landingTuning.motorRecoveryRampMs;
     wifiDebugServer.publish(telemetry, nowMs);
   }
 

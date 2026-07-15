@@ -594,15 +594,16 @@ class BalanceTelemetryWorker(QThread):
     @staticmethod
     def _parse_telemetry(text: str):
         parts = text.split(",")
-        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "4"], ["T", "5"]):
+        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "4"], ["T", "5"], ["T", "6"]):
             return None
-        expected_fields = {"1": 31, "2": 33, "3": 40, "4": 48, "5": 50}[parts[1]]
+        expected_fields = {"1": 31, "2": 33, "3": 40, "4": 48, "5": 50, "6": 61}[parts[1]]
         if len(parts) != expected_fields:
             return None
         try:
             values = [float(value) for value in parts[7:]]
-            if parts[1] in ("4", "5"):
+            if parts[1] in ("4", "5", "6"):
                 return {
+                    "protocol_version": int(parts[1]),
                     "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
                     "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
                     "pitch": values[0], "pitch_rate": values[1], "accel_pitch": values[2],
@@ -622,10 +623,22 @@ class BalanceTelemetryWorker(QThread):
                     "balance_d_term": values[34], "balance_motor_raw": values[35],
                     "speed_invert": int(values[36]), "turn_kp": values[37], "turn_ki": values[38],
                     "max_turn": values[39], "turn_invert": int(values[40]),
-                    "heading": values[41] if parts[1] == "5" else None,
-                    "yaw_rate": values[42] if parts[1] == "5" else None,
+                    "heading": values[41] if parts[1] in ("5", "6") else None,
+                    "yaw_rate": values[42] if parts[1] in ("5", "6") else None,
+                    "landing_enabled": int(values[43]) if parts[1] == "6" else None,
+                    "landing_state": int(values[44]) if parts[1] == "6" else None,
+                    "accel_magnitude": values[45] if parts[1] == "6" else None,
+                    "landing_airborne_g": values[46] if parts[1] == "6" else None,
+                    "landing_confirm_ms": values[47] if parts[1] == "6" else None,
+                    "landing_max_airborne_ms": values[48] if parts[1] == "6" else None,
+                    "landing_min_g": values[49] if parts[1] == "6" else None,
+                    "landing_max_g": values[50] if parts[1] == "6" else None,
+                    "landing_settle_ms": values[51] if parts[1] == "6" else None,
+                    "landing_timeout_ms": values[52] if parts[1] == "6" else None,
+                    "landing_ramp_ms": values[53] if parts[1] == "6" else None,
                 }
             return {
+                "protocol_version": int(parts[1]),
                 "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
                 "state": int(parts[4]), "fault": int(parts[5]), "imu_valid": int(parts[6]),
                 "pitch": values[0], "pitch_rate": values[1], "accel_pitch": values[2],
@@ -649,6 +662,12 @@ class BalanceTelemetryWorker(QThread):
                 "differential_speed": None, "differential_speed_error": None,
                 "turn_motor_command": None, "applied_turn_motor_command": None,
                 "turn_kp": None, "turn_ki": None, "max_turn": None, "turn_invert": None,
+                "heading": None, "yaw_rate": None,
+                "landing_enabled": None, "landing_state": None, "accel_magnitude": None,
+                "landing_airborne_g": None, "landing_confirm_ms": None,
+                "landing_max_airborne_ms": None, "landing_min_g": None,
+                "landing_max_g": None, "landing_settle_ms": None,
+                "landing_timeout_ms": None, "landing_ramp_ms": None,
             }
         except ValueError:
             return None
@@ -984,6 +1003,7 @@ class MainWindow(QMainWindow):
         self.balance_pending_sequences = {}
         self.balance_pending_controls = {}
         self.balance_tuning_loaded = False
+        self.landing_tuning_loaded = False
         self.balance_last_received_monotonic = None
         self.balance_last_telemetry_sequence = None
         self.balance_last_board_timestamp_ms = None
@@ -1158,7 +1178,8 @@ class MainWindow(QMainWindow):
             ("wheel_speed", "左右车轮线速度 (m/s)"),
             ("heading", "相对航向 / 转向角速度 (° / °/s)"),
             ("pitch_offset", "速度环俯角输出 (°)"), ("turn", "目标/实际差速度与转向输出"),
-            ("motor", "左右电机输出"), ("packet", "包序号 / 包龄 / 频率"),
+            ("motor", "左右电机输出"), ("landing", "跳台保护（开关 / 状态）"),
+            ("accel_magnitude", "加速度模长 |a| (g)"), ("packet", "包序号 / 包龄 / 频率"),
         ]
         for index, (key, title) in enumerate(status_fields):
             row, column = divmod(index, 3)
@@ -1265,6 +1286,68 @@ class MainWindow(QMainWindow):
         climb_grid.addWidget(self.btn_apply_climb_tuning, 4, 0, 1, 4)
         layout.addWidget(climb_group)
 
+        landing_group = QGroupBox("跳台落地调试（仅可在未启动平衡时配置）")
+        landing_grid = QGridLayout(landing_group)
+        landing_grid.addWidget(QLabel("保护开关:"), 0, 0)
+        self.btn_landing_enable = QPushButton("启用腾空 / 落地保护")
+        self.btn_landing_enable.setToolTip(
+            "仅在 STANDBY 状态下生效；启用后，检测到确认腾空会清除运动命令并暂停电机输出。"
+        )
+        self.btn_landing_enable.clicked.connect(lambda: self.request_airborne_landing_mode(True))
+        self.btn_landing_enable.setEnabled(False)
+        landing_grid.addWidget(self.btn_landing_enable, 0, 1, 1, 2)
+        self.btn_landing_disable = QPushButton("关闭保护")
+        self.btn_landing_disable.setToolTip("仅在 STANDBY 状态下生效；不会修改固件的默认配置，重启后恢复默认值。")
+        self.btn_landing_disable.clicked.connect(lambda: self.request_airborne_landing_mode(False))
+        self.btn_landing_disable.setEnabled(False)
+        landing_grid.addWidget(self.btn_landing_disable, 0, 3, 1, 2)
+        self.lbl_landing_mode_status = QLabel("等待支持 T,6 遥测的固件")
+        self.lbl_landing_mode_status.setStyleSheet("color: #666;")
+        landing_grid.addWidget(self.lbl_landing_mode_status, 0, 5, 1, 3)
+
+        self.landing_tuning_controls = {}
+        landing_fields = [
+            ("landing_airborne_g", "腾空阈值 |a| (g)", 0.35, 3, 0.05, 0.95, 0.01,
+             "低于此值并持续确认时间后进入 AIRBORNE。数值过高会误触发，过低可能漏检腾空。"),
+            ("landing_confirm_ms", "腾空确认 (ms)", 20, 0, 0, 100, 1,
+             "连续失重的最短确认时间。"),
+            ("landing_max_airborne_ms", "最大腾空时长 (ms)", 500, 0, 100, 2000, 10,
+             "超过该时间未确认落地会进入故障保护。"),
+            ("landing_min_g", "落地稳定下限 (g)", 0.75, 3, 0.10, 3.50, 0.01,
+             "落地后加速度模长稳定带的下限。"),
+            ("landing_max_g", "落地稳定上限 (g)", 1.25, 3, 0.20, 4.00, 0.01,
+             "落地后加速度模长稳定带的上限；冲击尖峰不应以此值衡量。"),
+            ("landing_settle_ms", "稳定观察 (ms)", 60, 0, 10, 500, 5,
+             "连续处于稳定加速度带后才重新锚定姿态。"),
+            ("landing_timeout_ms", "落地恢复超时 (ms)", 700, 0, 100, 3000, 10,
+             "落地后迟迟不能稳定时的故障超时。"),
+            ("landing_ramp_ms", "电机恢复斜坡 (ms)", 250, 0, 0, 1500, 10,
+             "姿态重置后将平衡电机输出从 0 平滑恢复到完整限幅。"),
+        ]
+        for index, (key, title, value, decimals, minimum, maximum, step, tooltip) in enumerate(landing_fields):
+            row, column = divmod(index, 2)
+            landing_grid.addWidget(QLabel(title + ":"), row + 1, column * 4)
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setRange(minimum, maximum)
+            spin.setSingleStep(step)
+            spin.setValue(value)
+            spin.setMinimumWidth(115)
+            spin.setToolTip(tooltip)
+            self.landing_tuning_controls[key] = spin
+            landing_grid.addWidget(spin, row + 1, column * 4 + 1)
+
+        landing_grid.addWidget(
+            QLabel("建议先在 10 / 20 / 35 mm 小落差验证；CSV 会同步记录保护状态与加速度模长，视频仍用于观察冲击峰值。"),
+            5, 0, 1, 6
+        )
+        self.btn_apply_landing_tuning = QPushButton("应用跳台落地判据")
+        self.btn_apply_landing_tuning.setToolTip("仅在 STANDBY 状态下可下发；运行期间不能修改，防止同一次落地使用混合判据。")
+        self.btn_apply_landing_tuning.clicked.connect(self.apply_landing_tuning)
+        self.btn_apply_landing_tuning.setEnabled(False)
+        landing_grid.addWidget(self.btn_apply_landing_tuning, 5, 6, 1, 2)
+        layout.addWidget(landing_group)
+
         console_group = QGroupBox("主板串口日志镜像")
         console_layout = QVBoxLayout(console_group)
         self.balance_console_log = QTextEdit()
@@ -1338,9 +1421,11 @@ class MainWindow(QMainWindow):
         self.btn_balance_connect.setEnabled(False)
         self.btn_balance_disconnect.setEnabled(True)
         self.balance_tuning_loaded = False
+        self.landing_tuning_loaded = False
         self.btn_apply_balance_loop_tuning.setEnabled(False)
         self.btn_apply_balance_tuning.setEnabled(False)
         self.btn_apply_climb_tuning.setEnabled(False)
+        self.btn_apply_landing_tuning.setEnabled(False)
         self.btn_balance_stop.setEnabled(True)
         self.btn_balance_reset.setEnabled(True)
         self.btn_balance_arm.setEnabled(False)
@@ -1361,8 +1446,12 @@ class MainWindow(QMainWindow):
         self.btn_balance_motion_stop.setEnabled(False)
         self.btn_climb_enable.setEnabled(False)
         self.btn_climb_disable.setEnabled(False)
+        self.btn_landing_enable.setEnabled(False)
+        self.btn_landing_disable.setEnabled(False)
         self.lbl_climb_mode_status.setText("未启用")
         self.lbl_climb_mode_status.setStyleSheet("color: #666;")
+        self.lbl_landing_mode_status.setText("等待支持 T,6 遥测的固件")
+        self.lbl_landing_mode_status.setStyleSheet("color: #666;")
         self.btn_route_start.setEnabled(False)
         self.btn_route_cancel.setEnabled(False)
         self.balance_ip_edit.setEnabled(False)
@@ -1381,6 +1470,7 @@ class MainWindow(QMainWindow):
             self.balance_pending_sequences.clear()
             self.balance_pending_controls.clear()
         self.balance_tuning_loaded = False
+        self.landing_tuning_loaded = False
         self.balance_last_telemetry_sequence = None
         self.balance_last_board_timestamp_ms = None
         self._stop_speed_recording()
@@ -1392,6 +1482,7 @@ class MainWindow(QMainWindow):
             self.btn_apply_balance_loop_tuning.setEnabled(False)
             self.btn_apply_balance_tuning.setEnabled(False)
             self.btn_apply_climb_tuning.setEnabled(False)
+            self.btn_apply_landing_tuning.setEnabled(False)
             self.btn_balance_arm.setEnabled(False)
             self.btn_balance_stop.setEnabled(False)
             self.btn_balance_reset.setEnabled(False)
@@ -1408,8 +1499,12 @@ class MainWindow(QMainWindow):
             self.btn_balance_motion_stop.setEnabled(False)
             self.btn_climb_enable.setEnabled(False)
             self.btn_climb_disable.setEnabled(False)
+            self.btn_landing_enable.setEnabled(False)
+            self.btn_landing_disable.setEnabled(False)
             self.lbl_climb_mode_status.setText("未连接")
             self.lbl_climb_mode_status.setStyleSheet("color: #666;")
+            self.lbl_landing_mode_status.setText("未连接")
+            self.lbl_landing_mode_status.setStyleSheet("color: #666;")
             self.cancel_route(send_stop=False)
             self.btn_route_start.setEnabled(False)
             self.balance_ip_edit.setEnabled(True)
@@ -1444,6 +1539,10 @@ class MainWindow(QMainWindow):
                 "differential_speed_error_mps", "turn_motor_command", "applied_turn_motor_command",
                 "turn_kp", "turn_ki", "max_turn", "turn_invert",
                 "relative_heading_deg", "yaw_rate_deg_per_s",
+                "landing_protection_enabled", "landing_state", "acceleration_magnitude_g",
+                "landing_airborne_threshold_g", "landing_confirmation_ms", "landing_max_airborne_ms",
+                "landing_acceleration_minimum_g", "landing_acceleration_maximum_g",
+                "landing_settle_ms", "landing_recovery_timeout_ms", "landing_motor_ramp_ms",
             ])
             self.speed_record_file.flush()
             self.log(f"速度记录已开始：{self.speed_record_path}")
@@ -1499,6 +1598,13 @@ class MainWindow(QMainWindow):
                 optional_float("turn_ki"), optional_float("max_turn"),
                 "" if telemetry.get("turn_invert") is None else telemetry["turn_invert"],
                 optional_float("heading"), optional_float("yaw_rate"),
+                "" if telemetry.get("landing_enabled") is None else telemetry["landing_enabled"],
+                "" if telemetry.get("landing_state") is None else telemetry["landing_state"],
+                optional_float("accel_magnitude"),
+                optional_float("landing_airborne_g"), optional_float("landing_confirm_ms"),
+                optional_float("landing_max_airborne_ms"), optional_float("landing_min_g"),
+                optional_float("landing_max_g"), optional_float("landing_settle_ms"),
+                optional_float("landing_timeout_ms"), optional_float("landing_ramp_ms"),
             ])
             # 每包落盘，异常关闭时也最多损失当前一行记录。
             self.speed_record_file.flush()
@@ -1542,17 +1648,39 @@ class MainWindow(QMainWindow):
             command_fields, "已发送上坡模式参数，等待主板 ACK 确认；参数将在启用上坡模式后生效"
         )
 
+    def apply_landing_tuning(self):
+        if not self.landing_tuning_loaded:
+            self.log("跳台落地调试需要支持 T,6 遥测的新固件；请先烧录当前工程")
+            return
+        command_fields = [
+            ("landing", "airborne_g", "landing_airborne_g"),
+            ("landing", "confirm_ms", "landing_confirm_ms"),
+            ("landing", "max_airborne_ms", "landing_max_airborne_ms"),
+            ("landing", "landing_min_g", "landing_min_g"),
+            ("landing", "landing_max_g", "landing_max_g"),
+            ("landing", "settle_ms", "landing_settle_ms"),
+            ("landing", "timeout_ms", "landing_timeout_ms"),
+            ("landing", "ramp_ms", "landing_ramp_ms"),
+        ]
+        self._send_tuning_commands(
+            command_fields, "已发送跳台落地判据；主板仅会在 STANDBY 状态接收，等待 ACK 确认"
+        )
+
     def _tuning_control_value(self, key: str) -> float:
         control = self.balance_tuning_spins.get(key)
         if control is None:
-            control = self.climb_tuning_controls[key]
+            control = self.climb_tuning_controls.get(key)
+        if control is None:
+            control = self.landing_tuning_controls[key]
         return 1.0 if isinstance(control, QCheckBox) and control.isChecked() else \
             (0.0 if isinstance(control, QCheckBox) else control.value())
 
     def _set_tuning_control_value(self, key: str, value: float):
         control = self.balance_tuning_spins.get(key)
         if control is None:
-            control = self.climb_tuning_controls[key]
+            control = self.climb_tuning_controls.get(key)
+        if control is None:
+            control = self.landing_tuning_controls[key]
         if isinstance(control, QCheckBox):
             control.setChecked(value >= 0.5)
         else:
@@ -1565,6 +1693,7 @@ class MainWindow(QMainWindow):
         self.btn_apply_balance_loop_tuning.setEnabled(False)
         self.btn_apply_balance_tuning.setEnabled(False)
         self.btn_apply_climb_tuning.setEnabled(False)
+        self.btn_apply_landing_tuning.setEnabled(False)
         for domain, parameter, key in command_fields:
             self.balance_command_sequence += 1
             value = self._tuning_control_value(key)
@@ -1759,6 +1888,22 @@ class MainWindow(QMainWindow):
         self.lbl_climb_mode_status.setText("正在请求启用上坡模式..." if enabled else "正在请求退出上坡模式...")
         self.lbl_climb_mode_status.setStyleSheet("color: #b36b00;")
 
+    def request_airborne_landing_mode(self, enabled: bool):
+        if self.balance_worker is None:
+            self.log("请先连接主板 Wi-Fi 调试端口")
+            return
+        if not self.landing_tuning_loaded:
+            self.log("跳台落地调试需要支持 T,6 遥测的新固件；请先烧录当前工程")
+            return
+        state_text = "on" if enabled else "off"
+        expected_reply = "LANDING_ON" if enabled else "LANDING_OFF"
+        self._send_balance_control(
+            "LANDING", state_text,
+            pending_control={"kind": "landing", "enabled": enabled, "expected_reply": expected_reply}
+        )
+        self.lbl_landing_mode_status.setText("正在请求启用保护..." if enabled else "正在请求关闭保护...")
+        self.lbl_landing_mode_status.setStyleSheet("color: #b36b00;")
+
     def request_balance_turn_speed(self):
         if self.balance_worker is None:
             self.log("请先连接主板 Wi-Fi 调试端口")
@@ -1857,6 +2002,36 @@ class MainWindow(QMainWindow):
                 f"{turn_motor_command:.3f} / {applied_turn_motor_command:.3f}"
             )
         value["motor"].setText(f"{telemetry['motor_left']:.3f}, {telemetry['motor_right']:.3f}")
+        landing_enabled = telemetry.get("landing_enabled")
+        landing_state = telemetry.get("landing_state")
+        landing_state_names = ["GROUNDED", "AIRBORNE", "LANDING_SETTLING", "RECOVERING", "FAULT"]
+        if landing_enabled is None or landing_state is None:
+            value["landing"].setText("需 T,6 固件")
+            value["accel_magnitude"].setText("-")
+            self.lbl_landing_mode_status.setText("需要支持 T,6 遥测的固件")
+            self.lbl_landing_mode_status.setStyleSheet("color: #c62828;")
+        else:
+            landing_state_name = (landing_state_names[landing_state]
+                                  if 0 <= landing_state < len(landing_state_names) else "UNKNOWN")
+            value["landing"].setText(
+                f"{'ON' if landing_enabled else 'OFF'} / {landing_state_name}"
+            )
+            acceleration_magnitude = telemetry.get("accel_magnitude")
+            value["accel_magnitude"].setText(
+                "-" if acceleration_magnitude is None else f"{acceleration_magnitude:.3f}"
+            )
+            if landing_state_name == "FAULT":
+                status_color = "#c62828"
+            elif landing_state_name in ("AIRBORNE", "LANDING_SETTLING", "RECOVERING"):
+                status_color = "#b36b00"
+            elif landing_enabled:
+                status_color = "#16803c"
+            else:
+                status_color = "#666"
+            self.lbl_landing_mode_status.setText(
+                f"{'保护已启用' if landing_enabled else '保护已关闭'}：{landing_state_name}"
+            )
+            self.lbl_landing_mode_status.setStyleSheet(f"color: {status_color};")
         if not self.balance_tuning_loaded:
             # Only the first complete telemetry frame initializes the edit
             # controls. Periodic telemetry is display data, not an authority
@@ -1869,6 +2044,13 @@ class MainWindow(QMainWindow):
             self.btn_apply_balance_tuning.setEnabled(True)
             self.btn_apply_climb_tuning.setEnabled(True)
             self.log("已从主板读取当前 PID / PI 参数；现在可安全下发修改")
+
+        if landing_enabled is not None and not self.landing_tuning_loaded:
+            for key in self.landing_tuning_controls:
+                if telemetry.get(key) is not None:
+                    self.landing_tuning_controls[key].setValue(telemetry[key])
+            self.landing_tuning_loaded = True
+            self.log("已从主板读取跳台落地保护判据；仅在 STANDBY 状态下可修改")
 
         self.lbl_balance_link.setText("已收到主板遥测")
         self.lbl_balance_link.setStyleSheet("color: #16803c;")
@@ -1891,6 +2073,16 @@ class MainWindow(QMainWindow):
         self.btn_balance_motion_stop.setEnabled(drive_enabled)
         self.btn_climb_enable.setEnabled(drive_enabled)
         self.btn_climb_disable.setEnabled(drive_enabled)
+        landing_control_pending = any(
+            item.get("kind") == "landing" for item in self.balance_pending_controls.values()
+        )
+        landing_configurable = (
+            self.balance_worker is not None and state == "STANDBY" and self.landing_tuning_loaded
+            and not self.balance_pending_sequences and not landing_control_pending
+        )
+        self.btn_landing_enable.setEnabled(landing_configurable)
+        self.btn_landing_disable.setEnabled(landing_configurable)
+        self.btn_apply_landing_tuning.setEnabled(landing_configurable)
         self.btn_route_start.setEnabled(drive_enabled and not self.route_active)
         self._update_route(telemetry, state)
         self._update_balance_packet_age(sequence)
@@ -1906,14 +2098,17 @@ class MainWindow(QMainWindow):
             return
         pending_control = self.balance_pending_controls.pop(sequence, None)
         if pending_control is not None:
+            is_landing_control = pending_control["kind"] == "landing"
+            status_label = self.lbl_landing_mode_status if is_landing_control else self.lbl_climb_mode_status
+            control_name = "跳台落地保护" if is_landing_control else "上坡模式"
             if fields[2] == "OK" and fields[3] == pending_control["expected_reply"]:
                 enabled = pending_control["enabled"]
-                self.lbl_climb_mode_status.setText("已启用（主板 ACK 确认）" if enabled else "已退出（主板 ACK 确认）")
-                self.lbl_climb_mode_status.setStyleSheet("color: #16803c;" if enabled else "color: #666;")
+                status_label.setText("已启用（主板 ACK 确认）" if enabled else "已关闭（主板 ACK 确认）")
+                status_label.setStyleSheet("color: #16803c;" if enabled else "color: #666;")
             else:
-                self.lbl_climb_mode_status.setText(f"上坡模式命令被拒绝：{fields[3]}")
-                self.lbl_climb_mode_status.setStyleSheet("color: #c62828;")
-                self.log(f"[ERROR] 上坡模式控制失败：{fields[3]}")
+                status_label.setText(f"{control_name}命令被拒绝：{fields[3]}")
+                status_label.setStyleSheet("color: #c62828;")
+                self.log(f"[ERROR] {control_name}控制失败：{fields[3]}")
             return
         pending = self.balance_pending_sequences.pop(sequence, None)
         if pending is None:
@@ -1948,9 +2143,12 @@ class MainWindow(QMainWindow):
     def on_balance_command_failed(self, sequence: int, reason: str):
         pending_control = self.balance_pending_controls.pop(sequence, None)
         if pending_control is not None:
-            self.lbl_climb_mode_status.setText(f"上坡模式命令超时：{reason}")
-            self.lbl_climb_mode_status.setStyleSheet("color: #c62828;")
-            self.log(f"[ERROR] 上坡模式控制命令超时：{reason}")
+            is_landing_control = pending_control["kind"] == "landing"
+            status_label = self.lbl_landing_mode_status if is_landing_control else self.lbl_climb_mode_status
+            control_name = "跳台落地保护" if is_landing_control else "上坡模式"
+            status_label.setText(f"{control_name}命令超时：{reason}")
+            status_label.setStyleSheet("color: #c62828;")
+            self.log(f"[ERROR] {control_name}控制命令超时：{reason}")
             return
         pending = self.balance_pending_sequences.pop(sequence, None)
         if pending is not None:
@@ -1964,6 +2162,9 @@ class MainWindow(QMainWindow):
         self.btn_apply_balance_loop_tuning.setEnabled(self.balance_tuning_loaded)
         self.btn_apply_balance_tuning.setEnabled(self.balance_tuning_loaded)
         self.btn_apply_climb_tuning.setEnabled(self.balance_tuning_loaded)
+        # The next telemetry frame re-enables this only in STANDBY. Do not
+        # briefly make landing criteria editable while the car is balancing.
+        self.btn_apply_landing_tuning.setEnabled(False)
 
     def on_balance_console_line(self, line: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]

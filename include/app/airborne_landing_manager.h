@@ -25,6 +25,22 @@ enum class AirborneLandingEvent : uint8_t
   Fault,
 };
 
+// Runtime copy of the landing-protection settings. It intentionally lives in
+// the manager rather than mutating the compile-time vehicle configuration, so
+// Wi-Fi test adjustments are discarded by a reboot.
+struct AirborneLandingTuning
+{
+  bool enabled = false;
+  float airborneAccelerationThresholdG = 0.35F;
+  uint16_t airborneConfirmationMs = 20;
+  uint16_t maximumAirborneMs = 500;
+  float landingAccelerationMinimumG = 0.75F;
+  float landingAccelerationMaximumG = 1.25F;
+  uint16_t landingSettleMs = 60;
+  uint16_t landingRecoveryTimeoutMs = 700;
+  uint16_t motorRecoveryRampMs = 250;
+};
+
 // Protects the control loops when the wheels have no usable ground contact.
 // It deliberately does not claim to make a high drop safe: it prevents the
 // ground-control loops from acting on free-fall accelerometer data and only
@@ -43,13 +59,23 @@ public:
   bool allowMotionControl() const;
   float motorOutputScale(uint32_t nowMs) const;
   AirborneLandingState state() const;
+  AirborneLandingTuning tuning() const;
+  void setEnabled(bool enabled);
+  void setAirborneAccelerationThresholdG(float thresholdG);
+  void setAirborneConfirmationMs(uint16_t durationMs);
+  void setMaximumAirborneMs(uint16_t durationMs);
+  void setLandingAccelerationMinimumG(float accelerationG);
+  void setLandingAccelerationMaximumG(float accelerationG);
+  void setLandingSettleMs(uint16_t durationMs);
+  void setLandingRecoveryTimeoutMs(uint16_t durationMs);
+  void setMotorRecoveryRampMs(uint16_t durationMs);
   static const char *stateName(AirborneLandingState state);
+  static float accelerationMagnitudeG(const drivers::ImuSample &sample);
 
 private:
   bool accelerationInLandingBand(const drivers::ImuSample &sample) const;
-  static float accelerationMagnitudeG(const drivers::ImuSample &sample);
 
-  const config::AirborneLandingConfiguration &_configuration;
+  AirborneLandingTuning _tuning;
   AirborneLandingState _state = AirborneLandingState::Grounded;
   uint32_t _lowAccelerationStartedAtMs = 0;
   uint32_t _airborneStartedAtMs = 0;

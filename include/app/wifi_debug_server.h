@@ -17,6 +17,7 @@ enum class WifiCommandKind : uint8_t
   Drive,
   Turn,
   ClimbMode,
+  AirborneLandingMode,
 };
 
 struct WifiTuningCommand
@@ -78,6 +79,17 @@ struct WifiTelemetry
   float maximumPitchOffsetDegrees = 0.0F;
   float headingDegrees = 0.0F;
   float yawRateDegreesPerSecond = 0.0F;
+  bool airborneLandingEnabled = false;
+  uint8_t airborneLandingState = 0;
+  float accelerationMagnitudeG = 0.0F;
+  float airborneAccelerationThresholdG = 0.35F;
+  uint16_t airborneConfirmationMs = 20;
+  uint16_t maximumAirborneMs = 500;
+  float landingAccelerationMinimumG = 0.75F;
+  float landingAccelerationMaximumG = 1.25F;
+  uint16_t landingSettleMs = 60;
+  uint16_t landingRecoveryTimeoutMs = 700;
+  uint16_t motorRecoveryRampMs = 250;
 };
 
 // Wi-Fi transport only: it has no knowledge of motors, arming, or control laws.
