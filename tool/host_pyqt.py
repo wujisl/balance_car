@@ -1044,7 +1044,7 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(QLabel("前进 / 后退速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
-        self.spin_balance_drive_speed.setRange(-0.250, 0.250)
+        self.spin_balance_drive_speed.setRange(-1.500, 1.500)
         self.spin_balance_drive_speed.setSingleStep(0.010)
         self.spin_balance_drive_speed.setValue(0.0)
         self.spin_balance_drive_speed.setEnabled(False)
@@ -1232,7 +1232,7 @@ class MainWindow(QMainWindow):
              "普通速度环输出、上坡前馈和上坡积分之和的限幅。"),
             ("climb_max_motor", "最大共同电机输出 (0–1)", 0.60, 3, 0.0, 1.0, 0.01,
              "启用上坡模式后的电机上限；提高前请确认电池、驱动和电机温度。"),
-            ("climb_max_speed", "最大上坡目标速度 (m/s)", 0.12, 3, 0.0, 0.25, 0.01,
+            ("climb_max_speed", "最大上坡目标速度 (m/s)", 0.12, 3, 0.0, 1.50, 0.01,
              "上坡模式会把更高的前进目标速度限制到此值。"),
             ("climb_max_turn", "最大上坡转向输出 (0–1)", 0.06, 3, 0.0, 1.0, 0.01,
              "上坡时给转向保留的最大电机输出；较小值优先保证共同驱动力。"),

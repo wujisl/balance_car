@@ -202,7 +202,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 5,
       // Initial mechanical-balance trim measured on the assembled vehicle.
       .targetPitchDegrees = -2.09F,
-      .proportionalGain = 0.12F,
+      .proportionalGain = 0.09F,
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
@@ -216,7 +216,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .controlPeriodMs = 40,
       // Vehicle-tested P-only starting point. Refine from this point with
       // small increments after confirming encoder direction.
-      .proportionalGain = 11.0F,
+      .proportionalGain = 13.0F,
       .integralGain = 0.0F,
       .integralLimit = 2.0F,
       .maximumPitchOffsetDegrees = 6.0F,
@@ -235,7 +235,7 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
       .integralUnwindRateDegreesPerSecond = 3.0F,
       .maximumPitchOffsetDegrees = 9.0F,
       .maximumMotorCommand = 0.60F,
-      .maximumTargetSpeedMps = 0.12F,
+      .maximumTargetSpeedMps = 1.50F,
       .maximumDifferentialSpeedMps = 0.04F,
       .maximumTurnMotorCommand = 0.06F,
       .outputInverted = false,
@@ -261,8 +261,8 @@ constexpr EncoderConfiguration kEncoderConfiguration = {
   };
 
   constexpr MotionConfiguration kMotionConfiguration = {
-      .maximumTargetSpeedMps = 0.25F,
-      .initialTargetSpeedMps = 0.06F,
+      .maximumTargetSpeedMps = 1.50F,
+      .initialTargetSpeedMps = 0.05F,
       .targetSpeedStepMps = 0.05F,
       // Target right-minus-left wheel speed for differential steering, in m/s.
       .maximumTurnCommand = 0.20F,
