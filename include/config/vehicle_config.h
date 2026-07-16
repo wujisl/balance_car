@@ -187,11 +187,11 @@ namespace balance_car::config
       .controlPeriodMs = 5,
       // Initial mechanical-balance trim measured on the assembled vehicle.
       .targetPitchDegrees = -2.09F,
-      .proportionalGain = 0.09F,
+      .proportionalGain = 0.14F,
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
-      .derivativeGain = 0.003F,
+      .derivativeGain = 0.02F,
       // The balance integrator is expressed in degree-seconds.  This keeps
       // the former 5000 samples at a 5 ms loop equivalent to 25 deg·s.
       .integralLimit = 25.0F,
@@ -203,8 +203,8 @@ namespace balance_car::config
       .controlPeriodMs = 40,
       // Vehicle-tested P-only starting point. Refine from this point with
       // small increments after confirming encoder direction.
-      .proportionalGain = 13.0F,
-      .integralGain = 0.0F,
+      .proportionalGain = 14.0F,
+      .integralGain = 0.003F,
       .integralLimit = 2.0F,
       .maximumPitchOffsetDegrees = 6.0F,
       .measurementFilterAlpha = 0.3F,
@@ -215,8 +215,8 @@ namespace balance_car::config
       // At zero measured differential speed this retains the former
       // turn-command-to-motor-command scale, while encoder feedback removes
       // left/right motor and surface mismatch.
-      .proportionalGain = 1.00F,
-      .integralGain = 0.01F,
+      .proportionalGain = 1.10F,
+      .integralGain = 0.001F,
       .integralLimit = 0.20F,
       .maximumTurnMotorCommand = 0.20F,
       .measurementFilterAlpha = 0.30F,

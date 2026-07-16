@@ -113,11 +113,11 @@ namespace
   bool visionCommandTransportHeld = false;
   float lastVisionDifferentialTargetMps = 0.0F;
   uint32_t lastVisionCommandMs = 0;
-  // Keep the I2C state exchange fast (50 Hz), but do not let every camera
-  // result replace a differential-speed step before the turn loop settles.
-  // Apply a new filtered target every 400 ms by default. I2C state exchange
-  // remains at 50 Hz and continues feeding the weighted sample window.
-  constexpr uint32_t kDefaultVisionTargetUpdatePeriodMs = 400U;
+  // Camera packets arrive at about 50 Hz. The target gate is independently
+  // adjustable from every new packet (0 ms) to 60 s; 40 ms matches the
+  // differential-speed loop and is the responsive default for successive
+  // S-bend direction changes.
+  constexpr uint32_t kDefaultVisionTargetUpdatePeriodMs = 40U;
   constexpr uint8_t kVisionTargetWindowSize = 5U;
   uint32_t visionTargetUpdatePeriodMs = kDefaultVisionTargetUpdatePeriodMs;
   bool visionTargetFilterEnabled = true;
@@ -711,8 +711,12 @@ namespace
     else if (strcmp(command.domain, "vision") == 0)
     {
       if (strcmp(command.parameter, "period_ms") == 0)
+      {
         visionTargetUpdatePeriodMs = static_cast<uint32_t>(
-            constrain(lroundf(command.value), 100L, 5000L));
+            constrain(lroundf(command.value), 0L, 60000L));
+        // Apply the next fresh camera sample immediately after changing rate.
+        lastVisionTargetUpdateMs = 0U;
+      }
       else if (strcmp(command.parameter, "filter") == 0)
       {
         visionTargetFilterEnabled = command.value >= 0.5F;
