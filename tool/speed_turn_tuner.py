@@ -373,6 +373,12 @@ class BalanceTelemetryWorker(QThread):
                 "turn_max": values[39],
                 "heading": values[41],
                 "yaw_rate": values[42],
+                # T,6 起开始回传视觉接管状态；当前主板固件为 T,9。
+                "vision_tracking": bool(int(values[43])) if version in ("6", "7", "8", "9") else None,
+                "vision_sample_fresh": bool(int(values[44])) if version in ("6", "7", "8", "9") else None,
+                "vision_command_accepted": bool(int(values[45])) if version in ("7", "8", "9") else None,
+                "vision_delta_speed": (values[46] if version in ("7", "8", "9")
+                                       else values[45] if version == "6" else None),
             }
         except (IndexError, ValueError):
             return None
@@ -912,8 +918,17 @@ class TuningMainWindow(QMainWindow):
         self.btn_stop.clicked.connect(lambda: self.send_control("STOP"))
         self.btn_stop.setEnabled(False)
         grid.addWidget(self.btn_stop, 2, 2, 1, 2)
+        self.vision_tracking = None
+        self.btn_vision_tracking = QPushButton("开启摄像头循迹")
+        self.btn_vision_tracking.setToolTip(
+            "仅在 BALANCING 状态可用。启用后，主板以相机 I²C 给出的目标转差控制转向；"
+            "手动设置目标转差会自动关闭循迹。按钮文字以主板 T,9 遥测回读为准。"
+        )
+        self.btn_vision_tracking.clicked.connect(self.toggle_vision_tracking)
+        self.btn_vision_tracking.setEnabled(False)
+        grid.addWidget(self.btn_vision_tracking, 2, 4, 1, 2)
         self.packet_label = QLabel("包：-")
-        grid.addWidget(self.packet_label, 2, 4, 1, 4)
+        grid.addWidget(self.packet_label, 2, 6, 1, 2)
         layout.addWidget(connection)
 
         self.tabs = QTabWidget()
@@ -980,6 +995,9 @@ class TuningMainWindow(QMainWindow):
             self.btn_disconnect.setEnabled(False)
             self.btn_arm.setEnabled(False)
             self.btn_stop.setEnabled(False)
+            self.vision_tracking = None
+            self.btn_vision_tracking.setEnabled(False)
+            self.btn_vision_tracking.setText("开启摄像头循迹")
             for page in (self.speed_page, self.turn_page):
                 page.set_connected(False)
             for field in (self.ip_edit, self.local_port_spin, self.command_port_spin):
@@ -1013,11 +1031,27 @@ class TuningMainWindow(QMainWindow):
             self.send_parameter(domain, str(parameter), float(value))
 
     def send_control(self, action: str, value: Optional[float] = None):
-        suffix = "" if value is None else f",{value:.3f}"
+        action = action.upper()
+        # 主板 TRACK 协议严格要求字符 `0` 或 `1`，不能发送 0.000 / 1.000。
+        if action == "TRACK" and value is not None:
+            suffix = ",1" if value >= 0.5 else ",0"
+        else:
+            suffix = "" if value is None else f",{value:.3f}"
         self.queue_command(
             f"C,{{sequence}},{action}{suffix}\n",
             {"kind": "control", "action": action, "value": value},
         )
+
+    def toggle_vision_tracking(self):
+        if self.worker is None:
+            self.on_error("尚未连接主板")
+            return
+        if self.vision_tracking is None:
+            self.on_error("当前固件未回传摄像头循迹状态；需要 T,6 或更新版本遥测")
+            return
+        requested = not self.vision_tracking
+        self.send_control("TRACK", 1.0 if requested else 0.0)
+        self.log(f"已请求{'开启' if requested else '关闭'}摄像头循迹，等待主板 ACK 与遥测回读")
 
     def send_parameter(self, domain: str, parameter: str, value: float):
         self.queue_command(
@@ -1049,6 +1083,15 @@ class TuningMainWindow(QMainWindow):
         self.link_label.setText("已收到主板遥测")
         self.link_label.setStyleSheet("color:#16803c;")
         self.btn_arm.setEnabled(self.worker is not None and state == "STANDBY" and telemetry["imu_valid"])
+        tracking = telemetry.get("vision_tracking")
+        if tracking is None:
+            self.vision_tracking = None
+            self.btn_vision_tracking.setEnabled(False)
+            self.btn_vision_tracking.setText("摄像头循迹（需 T,6+）")
+        else:
+            self.vision_tracking = bool(tracking)
+            self.btn_vision_tracking.setEnabled(self.worker is not None and state == "BALANCING")
+            self.btn_vision_tracking.setText("关闭摄像头循迹" if self.vision_tracking else "开启摄像头循迹")
         self.update_packet_age(sequence)
 
     def on_ack(self, text: str):
