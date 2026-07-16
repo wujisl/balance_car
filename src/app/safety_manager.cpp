@@ -73,6 +73,12 @@ bool SafetyManager::requestManualMotorTest(float leftPower, float rightPower, ui
   {
     return false;
   }
+  if (!isfinite(leftPower) || !isfinite(rightPower) ||
+      fabsf(leftPower) > _configuration.manualTestMaximumPower ||
+      fabsf(rightPower) > _configuration.manualTestMaximumPower)
+  {
+    return false;
+  }
 
   _motorDriver.setEnabled(true);
   _motorDriver.setNormalized(leftPower, rightPower);

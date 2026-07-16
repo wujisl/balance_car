@@ -50,6 +50,13 @@ from PyQt5.QtWidgets import (
 UDP_MAGIC = 0x55445043          # "UDPC"
 UDP_HEADER_FMT = "<IIHHHH"      # magic, frame_id, pkt_id, pkt_cnt, payload_len, reserved
 UDP_HEADER_LEN = struct.calcsize(UDP_HEADER_FMT)
+MAX_GUI_FRAME_RATE_HZ = 30.0
+CSV_FLUSH_INTERVAL_SECONDS = 1.0
+CSV_FLUSH_ROW_LIMIT = 50
+MAIN_LOG_MAX_BLOCKS = 1000
+TOOL_DIRECTORY = Path(__file__).resolve().parent
+PROJECT_ROOT = TOOL_DIRECTORY.parent
+CALIBRATION_OUTPUT_DIRECTORY = TOOL_DIRECTORY / "calibration" / "output"
 
 
 def encode_udp_command(quality: int = None, interval_ms: int = None, stream_divider: int = None,
@@ -123,6 +130,31 @@ class StreamWorker(QThread):
         self.base_url = base_url
         self.stream_url = urljoin(base_url + "/", "stream")
         self.running = False
+        # Do not use a Qt signal for every decoded frame.  Signals crossing
+        # threads are queued, so a GUI that is briefly busy would otherwise
+        # retain every old image and become slower forever.
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._last_error_text = ""
+        self._last_error_monotonic = 0.0
+
+    def _publish_latest_frame(self, img: np.ndarray):
+        with self._frame_lock:
+            self._latest_frame = img
+
+    def take_latest_frame(self):
+        with self._frame_lock:
+            img = self._latest_frame
+            self._latest_frame = None
+            return img
+
+    def _report_error(self, text: str):
+        now = time.monotonic()
+        if text == self._last_error_text and now - self._last_error_monotonic < 1.0:
+            return
+        self._last_error_text = text
+        self._last_error_monotonic = now
+        self.error_occurred.emit(text)
 
     def stop(self):
         self.running = False
@@ -135,23 +167,28 @@ class StreamWorker(QThread):
         try:
             resp = requests.get(self.stream_url, stream=True, timeout=5.0)
             if resp.status_code != 200:
-                self.error_occurred.emit(f"HTTP {resp.status_code}")
+                self._report_error(f"HTTP {resp.status_code}")
                 return
         except Exception as e:
-            self.error_occurred.emit(f"Connect failed: {e}")
+            self._report_error(f"Connect failed: {e}")
             return
 
         self.info_updated.emit("Stream connected")
 
         buffer = b""
         frame_count = 0
-        last_time = time.time()
+        last_time = time.monotonic()
+        last_decode_time = 0.0
 
         for chunk in resp.iter_content(chunk_size=4096):
             if not self.running:
                 break
 
             buffer += chunk
+            # A malformed/partial MJPEG stream must not grow the receive
+            # buffer without a bound and eventually consume all RAM.
+            if len(buffer) > 4 * 1024 * 1024:
+                buffer = buffer[-512 * 1024:]
 
             while self.running:
                 soi = buffer.find(b"\xff\xd8")
@@ -161,12 +198,19 @@ class StreamWorker(QThread):
                     jpeg_data = buffer[soi:eoi + 2]
                     buffer = buffer[eoi + 2:]
 
+                    now = time.monotonic()
+                    # The GUI renders at 30 Hz.  Decoding every faster input
+                    # frame only builds a queued backlog and makes the whole
+                    # desktop sluggish, so discard frames the GUI cannot use.
+                    if now - last_decode_time < 1.0 / MAX_GUI_FRAME_RATE_HZ:
+                        continue
+                    last_decode_time = now
+
                     img = self._decode_jpeg(jpeg_data)
                     if img is not None:
-                        self.frame_ready.emit(img)
+                        self._publish_latest_frame(img)
                         frame_count += 1
 
-                        now = time.time()
                         if now - last_time >= 1.0:
                             fps = frame_count / (now - last_time)
                             self.fps_updated.emit(fps)
@@ -202,6 +246,28 @@ class SingleFrameWorker(QThread):
         self.frame_url = urljoin(base_url + "/", "frame")
         self.interval_ms = interval_ms
         self.running = False
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
+        self._last_error_text = ""
+        self._last_error_monotonic = 0.0
+
+    def _publish_latest_frame(self, img: np.ndarray):
+        with self._frame_lock:
+            self._latest_frame = img
+
+    def take_latest_frame(self):
+        with self._frame_lock:
+            img = self._latest_frame
+            self._latest_frame = None
+            return img
+
+    def _report_error(self, text: str):
+        now = time.monotonic()
+        if text == self._last_error_text and now - self._last_error_monotonic < 1.0:
+            return
+        self._last_error_text = text
+        self._last_error_monotonic = now
+        self.error_occurred.emit(text)
 
     def stop(self):
         self.running = False
@@ -210,37 +276,42 @@ class SingleFrameWorker(QThread):
     def run(self):
         self.running = True
         frame_count = 0
-        last_time = time.time()
+        last_time = time.monotonic()
+        last_info_time = 0.0
 
         while self.running:
-            t0 = time.time()
+            t0 = time.monotonic()
             try:
                 resp = requests.get(self.frame_url, timeout=2.0)
                 if resp.status_code == 200:
                     img = self._decode_jpeg(resp.content)
                     if img is not None:
-                        self.frame_ready.emit(img)
+                        self._publish_latest_frame(img)
                         frame_count += 1
 
-                        now = time.time()
+                        now = time.monotonic()
                         if now - last_time >= 1.0:
                             fps = frame_count / (now - last_time)
                             self.fps_updated.emit(fps)
                             frame_count = 0
                             last_time = now
 
-                        self.info_updated.emit(
-                            f"Frame: {len(resp.content)} bytes, {img.shape[1]}x{img.shape[0]}"
-                        )
+                        if now - last_info_time >= 1.0:
+                            self.info_updated.emit(
+                                f"Frame: {len(resp.content)} bytes, {img.shape[1]}x{img.shape[0]}"
+                            )
+                            last_info_time = now
                     else:
-                        self.error_occurred.emit("Decode JPEG failed")
+                        self._report_error("Decode JPEG failed")
                 else:
-                    self.error_occurred.emit(f"HTTP {resp.status_code}")
+                    self._report_error(f"HTTP {resp.status_code}")
             except Exception as e:
-                self.error_occurred.emit(f"Request failed: {e}")
+                self._report_error(f"Request failed: {e}")
 
-            elapsed = (time.time() - t0) * 1000
-            sleep_ms = max(10, self.interval_ms - elapsed)
+            elapsed = (time.monotonic() - t0) * 1000
+            # A single-frame HTTP request is far more expensive than a normal
+            # draw operation.  Do not allow it to flood the GUI above 30 Hz.
+            sleep_ms = max(int(1000.0 / MAX_GUI_FRAME_RATE_HZ), self.interval_ms - elapsed)
             time.sleep(sleep_ms / 1000.0)
 
         self.info_updated.emit("Single-frame worker stopped")
@@ -345,6 +416,8 @@ class UdpStreamWorker(QThread):
         last_fps_time = last_stats_time
         fps_frames = 0
         last_frame_info_time = 0.0
+        last_decode_time = 0.0
+        skipped_decode_frames = 0
 
         while self.running and not self._stop_event.is_set():
             try:
@@ -408,19 +481,27 @@ class UdpStreamWorker(QThread):
                 expected_cnt = None
                 packets.clear()
 
+                now = time.monotonic()
+                # A completed UDP image is useful only when the GUI can show
+                # it.  JPEG decoding is CPU-heavy, so drop surplus complete
+                # frames before decoding rather than creating a CPU backlog.
+                last_completed_fid = completed_fid
+                if now - last_decode_time < 1.0 / MAX_GUI_FRAME_RATE_HZ:
+                    skipped_decode_frames += 1
+                    continue
+                last_decode_time = now
                 img = self._decode_jpeg(jpeg)
                 if img is not None:
                     decoded_frames += 1
                     fps_frames += 1
-                    last_completed_fid = completed_fid
                     self._publish_latest_frame(img)
-                    now = time.time()
-                    if now - last_frame_info_time >= 1.0:
+                    wall_now = time.time()
+                    if wall_now - last_frame_info_time >= 1.0:
                         self.info_updated.emit(
                             f"UDP latest: {len(jpeg)} bytes, {img.shape[1]}x{img.shape[0]}, "
                             f"packets {pcnt}"
                         )
-                        last_frame_info_time = now
+                        last_frame_info_time = wall_now
 
             # 每秒刷新一次统计
             now = time.monotonic()
@@ -432,7 +513,8 @@ class UdpStreamWorker(QThread):
                 fps_frames = 0
                 last_fps_time = now
                 self.stats_updated.emit(
-                    f"decoded={decoded_frames} dropped={dropped_frames} bad={malformed_packets} loss={loss:.1f}%"
+                    f"decoded={decoded_frames} skipped={skipped_decode_frames} "
+                    f"dropped={dropped_frames} bad={malformed_packets} loss={loss:.1f}%"
                 )
                 # 不重置计数，保持累计
                 last_stats_time = now
@@ -474,6 +556,21 @@ class BalanceTelemetryWorker(QThread):
         self._command_lock = threading.Lock()
         self._pending_commands = []
         self._inflight_command = None
+        # Telemetry is display/logging data, not a control input.  Keep only
+        # the newest packet so temporary GUI stalls cannot create an unbounded
+        # queued-signal backlog.
+        self._telemetry_lock = threading.Lock()
+        self._latest_telemetry = None
+
+    def _publish_latest_telemetry(self, telemetry: dict):
+        with self._telemetry_lock:
+            self._latest_telemetry = telemetry
+
+    def take_latest_telemetry(self):
+        with self._telemetry_lock:
+            telemetry = self._latest_telemetry
+            self._latest_telemetry = None
+            return telemetry
 
     def queue_command(self, command: bytes):
         if not command:
@@ -607,7 +704,7 @@ class BalanceTelemetryWorker(QThread):
                         telemetry["rx_hz"] = received_count / (now - rate_started)
                         received_count = 0
                         rate_started = now
-                    self.telemetry_ready.emit(telemetry)
+                    self._publish_latest_telemetry(telemetry)
                 elif text.startswith("A,"):
                     self._accept_ack(text)
                     self.ack_received.emit(text)
@@ -626,9 +723,9 @@ class BalanceTelemetryWorker(QThread):
     @staticmethod
     def _parse_telemetry(text: str):
         parts = text.split(",")
-        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "5"], ["T", "6"], ["T", "7"], ["T", "8"], ["T", "9"]):
+        if parts[0:2] not in (["T", "1"], ["T", "2"], ["T", "3"], ["T", "5"], ["T", "6"], ["T", "7"], ["T", "8"], ["T", "9"], ["T", "10"]):
             return None
-        expected_fields = {"1": 31, "2": 33, "3": 40, "5": 50, "6": 53, "7": 54, "8": 55, "9": 57}[parts[1]]
+        expected_fields = {"1": 31, "2": 33, "3": 40, "5": 50, "6": 53, "7": 54, "8": 55, "9": 57, "10": 64}[parts[1]]
         if len(parts) != expected_fields:
             return None
         try:
@@ -636,7 +733,7 @@ class BalanceTelemetryWorker(QThread):
             # T,7 retains the extended v5/v6 fields and appends the vision
             # hand-off status.  Treating it as the old compact layout makes
             # the UI display the target only and hides the real turn feedback.
-            rich = parts[1] in ("5", "6", "7", "8", "9")
+            rich = parts[1] in ("5", "6", "7", "8", "9", "10")
             return {
                 "telemetry_version": int(parts[1]),
                 "sequence": int(parts[2]), "timestamp_ms": int(parts[3]),
@@ -669,13 +766,20 @@ class BalanceTelemetryWorker(QThread):
                 "turn_kp": values[37] if rich else None,
                 "turn_ki": values[38] if rich else None,
                 "turn_max": values[39] if rich else None,
-                "vision_tracking": bool(int(values[43])) if parts[1] in ("6", "7", "8", "9") else None,
-                "vision_fresh": bool(int(values[44])) if parts[1] in ("6", "7", "8", "9") else None,
-                "vision_accepted": bool(int(values[45])) if parts[1] in ("7", "8", "9") else None,
-                "vision_dv": values[46] if parts[1] in ("7", "8", "9") else (values[45] if parts[1] == "6" else None),
-                "vision_period": values[47] if parts[1] in ("8", "9") else None,
-                "vision_filter": bool(int(values[48])) if parts[1] == "9" else None,
-                "vision_max_step": values[49] if parts[1] == "9" else None,
+                "vision_tracking": bool(int(values[43])) if parts[1] in ("6", "7", "8", "9", "10") else None,
+                "vision_fresh": bool(int(values[44])) if parts[1] in ("6", "7", "8", "9", "10") else None,
+                "vision_accepted": bool(int(values[45])) if parts[1] in ("7", "8", "9", "10") else None,
+                "vision_dv": values[46] if parts[1] in ("7", "8", "9", "10") else (values[45] if parts[1] == "6" else None),
+                "vision_period": values[47] if parts[1] in ("8", "9", "10") else None,
+                "vision_filter": bool(int(values[48])) if parts[1] in ("9", "10") else None,
+                "vision_max_step": values[49] if parts[1] in ("9", "10") else None,
+                "balance_saturated": bool(int(values[50])) if parts[1] == "10" else None,
+                "speed_saturated": bool(int(values[51])) if parts[1] == "10" else None,
+                "turn_saturated": bool(int(values[52])) if parts[1] == "10" else None,
+                "encoder_valid": bool(int(values[53])) if parts[1] == "10" else None,
+                "imu_calibrated": bool(int(values[54])) if parts[1] == "10" else None,
+                "balance_period_ms": values[55] if parts[1] == "10" else None,
+                "velocity_period_ms": values[56] if parts[1] == "10" else None,
             }
         except ValueError:
             return None
@@ -727,6 +831,8 @@ class VisionI2cDebugDialog(QDialog):
         self._csv_file = None
         self._csv_writer = None
         self._csv_path = None
+        self._csv_rows_since_flush = 0
+        self._csv_last_flush_monotonic = 0.0
         self._start_csv_log()
         clear_button = QPushButton("清空")
         clear_button.clicked.connect(self.log_view.clear)
@@ -755,9 +861,21 @@ class VisionI2cDebugDialog(QDialog):
                 "right_wheel_speed_mps", "measured_delta_speed_mps",
                 "vehicle_speed_mps", "target_speed_mps",
             ])
-            self._csv_file.flush()
+            self._csv_rows_since_flush = 0
+            self._csv_last_flush_monotonic = time.monotonic()
         except OSError:
             self._csv_file = self._csv_writer = self._csv_path = None
+
+    def _flush_csv_if_due(self, force: bool = False):
+        if self._csv_file is None or self._csv_rows_since_flush == 0:
+            return
+        now = time.monotonic()
+        if not force and self._csv_rows_since_flush < CSV_FLUSH_ROW_LIMIT and \
+                now - self._csv_last_flush_monotonic < CSV_FLUSH_INTERVAL_SECONDS:
+            return
+        self._csv_file.flush()
+        self._csv_rows_since_flush = 0
+        self._csv_last_flush_monotonic = now
 
     def _write_csv_log(self, timestamp: str, line: str):
         if self._csv_writer is None or self._csv_file is None:
@@ -785,13 +903,18 @@ class VisionI2cDebugDialog(QDialog):
                 fields.get("vavg", ""),
                 fields.get("vtarget", ""),
             ])
-            self._csv_file.flush()
+            self._csv_rows_since_flush += 1
+            self._flush_csv_if_due()
         except OSError:
             pass
 
     def closeEvent(self, event):
         if self._csv_file is not None:
-            self._csv_file.close()
+            try:
+                self._flush_csv_if_due(force=True)
+                self._csv_file.close()
+            except OSError:
+                pass
             self._csv_file = self._csv_writer = None
         if self.parent() is not None and hasattr(self.parent(), "vision_i2c_debug_dialog"):
             self.parent().vision_i2c_debug_dialog = None
@@ -811,6 +934,7 @@ class MainWindow(QMainWindow):
         self._display_timer = QTimer(self)
         self._display_timer.setInterval(33)  # Render at most 30 Hz; never queue stale frames.
         self._display_timer.timeout.connect(self._render_latest_display_frame)
+        self._last_calibration_preview_monotonic = 0.0
         self.intrinsic_samples = []
         self.intrinsic_result = None
         self.track_alignment = None
@@ -960,8 +1084,9 @@ class MainWindow(QMainWindow):
 
         tx_grid.addWidget(QLabel("单帧间隔 ms:"), 2, 0)
         self.spin_single_interval = QSpinBox()
-        self.spin_single_interval.setRange(20, 2000)
+        self.spin_single_interval.setRange(int(1000.0 / MAX_GUI_FRAME_RATE_HZ), 2000)
         self.spin_single_interval.setValue(100)
+        self.spin_single_interval.setToolTip("下限为 33 ms（30 Hz），避免 HTTP 请求和 GUI 队列长期积压。")
         tx_grid.addWidget(self.spin_single_interval, 2, 1)
 
         tx_grid.addWidget(QLabel("UDP 单包大小:"), 2, 2)
@@ -1148,6 +1273,7 @@ class MainWindow(QMainWindow):
         self.log_edit = QTextEdit()
         self.log_edit.setReadOnly(True)
         self.log_edit.setMaximumHeight(180)
+        self.log_edit.document().setMaximumBlockCount(MAIN_LOG_MAX_BLOCKS)
         main_layout.addWidget(self.log_edit)
 
         # 状态栏
@@ -1172,6 +1298,9 @@ class MainWindow(QMainWindow):
         self.balance_age_timer = QTimer(self)
         self.balance_age_timer.setInterval(100)
         self.balance_age_timer.timeout.connect(self._update_balance_packet_age)
+        self.balance_render_timer = QTimer(self)
+        self.balance_render_timer.setInterval(50)
+        self.balance_render_timer.timeout.connect(self._drain_balance_telemetry)
         # This page contains several control rows.  Keep their natural height
         # in full-screen/small-height windows instead of letting QGridLayout
         # compress rows until widgets overlap.
@@ -1228,9 +1357,12 @@ class MainWindow(QMainWindow):
         connection_grid.addWidget(QLabel("前进速度给定 (m/s):"), 3, 2)
         self.spin_balance_drive_speed = QDoubleSpinBox()
         self.spin_balance_drive_speed.setDecimals(3)
-        self.spin_balance_drive_speed.setRange(0.0, 0.250)
+        self.spin_balance_drive_speed.setRange(0.0, 0.600)
         self.spin_balance_drive_speed.setSingleStep(0.010)
         self.spin_balance_drive_speed.setValue(0.0)
+        self.spin_balance_drive_speed.setToolTip(
+            "上位机输入上限为 0.600 m/s；实际可接受范围仍由当前固件的安全限幅决定。"
+        )
         self.spin_balance_drive_speed.setEnabled(False)
         self.spin_balance_drive_speed.setToolTip("仅在 BALANCING 状态下可下发；主板会按 0.10 m/s² 斜坡改变给定")
         connection_grid.addWidget(self.spin_balance_drive_speed, 3, 3)
@@ -1313,16 +1445,16 @@ class MainWindow(QMainWindow):
         tuning_grid = QGridLayout(tuning_group)
         self.balance_tuning_spins = {}
         tuning_fields = [
-            ("balance_kp", "角度 Kp", 0.09, 5),
-            ("balance_ki", "角度 Ki", 0.0, 5),
+            ("balance_kp", "角度 Kp", 0.15, 5),
+            ("balance_ki", "角度 Ki", 0.002, 5),
             ("balance_kd", "角度 Kd", 0.003, 5),
-            ("balance_trim", "平衡点 Trim (°)", -2.09, 3),
-            ("speed_kp", "速度 Kp", 13.0, 5),
-            ("speed_ki", "速度 Ki", 0.15, 6),
+            ("balance_trim", "平衡点 Trim (°)", -1.19, 3),
+            ("speed_kp", "速度 Kp", 14.0, 5),
+            ("speed_ki", "速度 Ki", 0.003, 6),
             ("max_motor", "最大电机输出 (0–1)", 0.45, 3),
             ("max_pitch", "最大俯仰偏置 (°)", 6.0, 2),
-            ("turn_kp", "转差环 Kp", 1.0, 4),
-            ("turn_ki", "转差环 Ki", 0.0, 4),
+            ("turn_kp", "转差环 Kp", 1.1, 4),
+            ("turn_ki", "转差环 Ki", 0.001, 4),
             ("turn_max", "最大转向输出 (0–1)", 0.20, 3),
             ("vision_period", "视觉转差更新间隔 (ms)", 400.0, 0),
             ("vision_max_step", "单次转差最大变化 (mm/s, 0=不限)", 0.0, 0),
@@ -1500,7 +1632,10 @@ class MainWindow(QMainWindow):
         self.btn_solve_ground = QPushButton("验证并保存平地结果")
         self.btn_solve_ground.clicked.connect(self.solve_manual_flat_validation)
         ggrid.addWidget(self.btn_solve_ground, 1, 3, 1, 3)
-        self.lbl_ground_status = QLabel("定格后按 A→B→C→D→E→F 点选棋盘内角点。A-D 拟合，E/F 验证；需实测 A 的 X/Y 与格宽。")
+        self.lbl_ground_status = QLabel(
+            "定格后按 A→B→C→D→E→F 点选棋盘内角点。A-D 必须是相邻一格的四个角（顺时针），"
+            "E/F 选其右侧相邻两角作验证；需实测 A 的 X/Y 与格宽。结果仅作平地验证，不参与控制。"
+        )
         self.lbl_ground_status.setWordWrap(True)
         ggrid.addWidget(self.lbl_ground_status, 2, 0, 1, 6)
         layout.addWidget(ground)
@@ -1560,7 +1695,6 @@ class MainWindow(QMainWindow):
             self.balance_local_port.value(), self.balance_ip_edit.text().strip(),
             self.balance_command_port.value()
         )
-        self.balance_worker.telemetry_ready.connect(self.on_balance_telemetry)
         self.balance_worker.ack_received.connect(self.on_balance_ack)
         self.balance_worker.command_failed.connect(self.on_balance_command_failed)
         self.balance_worker.console_line_received.connect(self.on_balance_console_line)
@@ -1568,6 +1702,7 @@ class MainWindow(QMainWindow):
         self.balance_worker.error_occurred.connect(self.on_error)
         self.balance_worker.start()
         self.balance_age_timer.start()
+        self.balance_render_timer.start()
         self.balance_last_telemetry_sequence = None
         self.balance_last_board_timestamp_ms = None
         self.balance_command_sequence = int(time.time_ns() & 0x7fffffff)
@@ -1608,6 +1743,8 @@ class MainWindow(QMainWindow):
         self._stop_speed_recording()
         if hasattr(self, "balance_age_timer"):
             self.balance_age_timer.stop()
+        if hasattr(self, "balance_render_timer"):
+            self.balance_render_timer.stop()
         if hasattr(self, "btn_balance_connect"):
             self.btn_balance_connect.setEnabled(True)
             self.btn_balance_disconnect.setEnabled(False)
@@ -1652,8 +1789,11 @@ class MainWindow(QMainWindow):
                 "target_differential_speed_mps", "measured_differential_speed_mps",
                 "differential_speed_error_mps", "turn_motor_command", "applied_turn_motor_command",
                 "vision_tracking_enabled", "vision_sample_fresh", "vision_command_accepted", "camera_delta_speed_mps",
+                "balance_inner_saturated", "velocity_loop_saturated", "turn_loop_saturated",
+                "encoder_valid", "imu_calibrated", "balance_period_ms", "velocity_period_ms",
             ])
-            self.speed_record_file.flush()
+            self._speed_record_rows_since_flush = 0
+            self._speed_record_last_flush_monotonic = time.monotonic()
             self.log(f"速度记录已开始：{self.speed_record_path}")
         except OSError as error:
             self.speed_record_file = None
@@ -1661,11 +1801,23 @@ class MainWindow(QMainWindow):
             self.speed_record_path = None
             self.log(f"[ERROR] 无法创建速度记录文件：{error}")
 
+    def _flush_speed_record_if_due(self, force: bool = False):
+        if self.speed_record_file is None or self._speed_record_rows_since_flush == 0:
+            return
+        now = time.monotonic()
+        if not force and self._speed_record_rows_since_flush < CSV_FLUSH_ROW_LIMIT and \
+                now - self._speed_record_last_flush_monotonic < CSV_FLUSH_INTERVAL_SECONDS:
+            return
+        self.speed_record_file.flush()
+        self._speed_record_rows_since_flush = 0
+        self._speed_record_last_flush_monotonic = now
+
     def _stop_speed_recording(self):
         if self.speed_record_file is None:
             return
         record_path = self.speed_record_path
         try:
+            self._flush_speed_record_if_due(force=True)
             self.speed_record_file.close()
             self.log(f"速度记录已保存：{record_path}")
         except OSError as error:
@@ -1674,6 +1826,8 @@ class MainWindow(QMainWindow):
             self.speed_record_file = None
             self.speed_record_writer = None
             self.speed_record_path = None
+            self._speed_record_rows_since_flush = 0
+            self._speed_record_last_flush_monotonic = 0.0
 
     def _record_speed_telemetry(self, telemetry: dict):
         if self.speed_record_writer is None or self.speed_record_file is None:
@@ -1707,9 +1861,15 @@ class MainWindow(QMainWindow):
                 "" if telemetry.get("vision_fresh") is None else int(telemetry["vision_fresh"]),
                 "" if telemetry.get("vision_accepted") is None else int(telemetry["vision_accepted"]),
                 optional_float("vision_dv"),
+                "" if telemetry.get("balance_saturated") is None else int(telemetry["balance_saturated"]),
+                "" if telemetry.get("speed_saturated") is None else int(telemetry["speed_saturated"]),
+                "" if telemetry.get("turn_saturated") is None else int(telemetry["turn_saturated"]),
+                "" if telemetry.get("encoder_valid") is None else int(telemetry["encoder_valid"]),
+                "" if telemetry.get("imu_calibrated") is None else int(telemetry["imu_calibrated"]),
+                optional_float("balance_period_ms"), optional_float("velocity_period_ms"),
             ])
-            # 每包落盘，异常关闭时也最多损失当前一行记录。
-            self.speed_record_file.flush()
+            self._speed_record_rows_since_flush += 1
+            self._flush_speed_record_if_due()
         except (OSError, KeyError) as error:
             self.log(f"[ERROR] 写入速度记录失败：{error}")
             self._stop_speed_recording()
@@ -1741,6 +1901,29 @@ class MainWindow(QMainWindow):
         self._send_tuning_commands(
             command_fields, "已发送平衡环参数：Kp、Ki、Kd、Trim、最大电机输出；速度环参数未改动"
         )
+
+    def _apply_connection_default_pid_group(self):
+        """每次连接确认首包遥测后，下发用户指定的三环基准参数。"""
+        defaults = {
+            "balance_kp": 0.15,
+            "balance_ki": 0.002,
+            "balance_trim": -1.19,
+            "speed_kp": 14.0,
+            "speed_ki": 0.003,
+            "turn_kp": 1.1,
+            "turn_ki": 0.001,
+        }
+        for key, value in defaults.items():
+            self.balance_tuning_spins[key].setValue(value)
+        self._send_tuning_commands([
+            ("balance", "kp", "balance_kp"),
+            ("balance", "ki", "balance_ki"),
+            ("balance", "trim", "balance_trim"),
+            ("speed", "kp", "speed_kp"),
+            ("speed", "ki", "speed_ki"),
+            ("turn", "kp", "turn_kp"),
+            ("turn", "ki", "turn_ki"),
+        ], "已自动下发连接基准参数组（7 项），等待主板 ACK 与遥测回读")
 
     def _send_tuning_commands(self, command_fields, success_message: str):
         if self.balance_worker is None or not self.balance_tuning_loaded:
@@ -1908,6 +2091,15 @@ class MainWindow(QMainWindow):
             suffix = f" {value:.3f} m/s"
         self.log(f"已发送主板控制命令：{action}{suffix}（线协议：{command.strip()}）")
 
+    def _drain_balance_telemetry(self):
+        """Render only the newest worker packet at a bounded GUI rate."""
+        worker = self.balance_worker
+        if worker is None:
+            return
+        telemetry = worker.take_latest_telemetry()
+        if telemetry is not None:
+            self.on_balance_telemetry(telemetry)
+
     def on_balance_telemetry(self, telemetry: dict):
         sequence = telemetry["sequence"]
         board_timestamp_ms = telemetry["timestamp_ms"]
@@ -1993,6 +2185,7 @@ class MainWindow(QMainWindow):
             self.btn_apply_balance_loop_tuning.setEnabled(True)
             self.btn_apply_balance_tuning.setEnabled(True)
             self.log("已从主板读取当前 PID / PI 参数；现在可安全下发修改")
+            self._apply_connection_default_pid_group()
 
         self.lbl_balance_link.setText("已收到主板遥测")
         self.lbl_balance_link.setStyleSheet("color: #16803c;")
@@ -2074,9 +2267,10 @@ class MainWindow(QMainWindow):
     def on_balance_console_line(self, line: str):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.balance_console_log.append(f"[{timestamp}] {line}")
-        if line.startswith("[I2C]"):
-            if getattr(self, "vision_i2c_debug_dialog", None) is None:
-                self.vision_i2c_debug_dialog = VisionI2cDebugDialog(self)
+        if line.startswith("[I2C]") and getattr(self, "vision_i2c_debug_dialog", None) is not None:
+            # I²C CSV logging is opt-in through the dedicated dialog.  Do not
+            # silently create a window and keep flushing a file in the
+            # background merely because the board emits diagnostics.
             self.vision_i2c_debug_dialog.append_line(line)
 
     def _update_balance_packet_age(self, sequence=None):
@@ -2102,7 +2296,11 @@ class MainWindow(QMainWindow):
 
     def log(self, msg: str):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_edit.append(f"[{timestamp}] {msg}")
+        # Calibration restore happens while the UI is being built, before the
+        # visible log widget exists.  Never turn a recoverable old-file error
+        # into a startup failure.
+        if hasattr(self, "log_edit"):
+            self.log_edit.append(f"[{timestamp}] {msg}")
 
     def base_url(self) -> str:
         ip = self.ip_edit.text().strip()
@@ -2138,10 +2336,10 @@ class MainWindow(QMainWindow):
             self.worker = UdpStreamWorker(local_port, esp_ip, cmd_port)
 
         worker = self.worker
-        # Every callback is tied to this exact worker.  A delayed failure from
-        # an old HTTP session can therefore never affect a new UDP session.
-        if not isinstance(worker, UdpStreamWorker):
-            worker.frame_ready.connect(lambda image, source=worker: self._queue_worker_frame(source, image))
+        # Every callback is tied to this exact worker.  Decoded image frames
+        # are deliberately *not* sent through Qt signals: the display timer
+        # pulls one newest frame from the worker, preventing event-queue
+        # accumulation after a transient slow repaint.
         worker.fps_updated.connect(lambda fps, source=worker: self._on_worker_fps(source, fps))
         worker.info_updated.connect(lambda text, source=worker: self._on_worker_info(source, text))
         worker.error_occurred.connect(lambda text, source=worker: self._on_worker_error(source, text))
@@ -2398,9 +2596,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "内参标定", str(exc))
             return
         self.intrinsic_result = result
-        root = Path(__file__).resolve().parents[1]
         save_intrinsic_result(
-            root / "tools" / "calibration" / "output" / "intrinsic_calibration.json", result)
+            CALIBRATION_OUTPUT_DIRECTORY / "intrinsic_calibration.json", result)
         message = (f"内参完成：重投影误差 {result.reprojection_error_px:.3f} px，"
                    f"分辨率 {result.image_size[0]}x{result.image_size[1]}。")
         if result.reprojection_error_px > 1.0:
@@ -2409,7 +2606,7 @@ class MainWindow(QMainWindow):
         self.log(message + " 内参已保存；关闭上位机不会丢失。")
 
     def _restore_intrinsic_calibration(self):
-        path = Path(__file__).resolve().parents[1] / "tools" / "calibration" / "output" / "intrinsic_calibration.json"
+        path = CALIBRATION_OUTPUT_DIRECTORY / "intrinsic_calibration.json"
         if not path.exists():
             return
         try:
@@ -2422,7 +2619,7 @@ class MainWindow(QMainWindow):
             self.log(f"[ERROR] 无法读取保存的内参：{exc}")
 
     def _restore_track_alignment(self):
-        path = Path(__file__).resolve().parents[1] / "tools" / "calibration" / "output" / "track_alignment.json"
+        path = CALIBRATION_OUTPUT_DIRECTORY / "track_alignment.json"
         if not path.exists():
             return
         try:
@@ -2454,9 +2651,8 @@ class MainWindow(QMainWindow):
         self.track_alignment = TrackAlignment((frame.shape[1], frame.shape[0]), self.spin_roi_y1.value(),
                                               self.spin_roi_y2.value(), lookahead, x_zero, theta_zero,
                                               self.spin_align_ke.value(), self.spin_align_kh.value(), 0.08)
-        root = Path(__file__).resolve().parents[1]
-        output = root / "tools" / "calibration" / "output"
-        save_track_alignment(output / "track_alignment.json", self.track_alignment)
+        root = PROJECT_ROOT
+        save_track_alignment(CALIBRATION_OUTPUT_DIRECTORY / "track_alignment.json", self.track_alignment)
         try:
             write_cpp_header(root / "include" / "config" / "vision_calibration.h", self.intrinsic_result, self.track_alignment)
         except ValueError as exc:
@@ -2475,8 +2671,7 @@ class MainWindow(QMainWindow):
                                                 self.calib_square_mm.value(), self.ground_x.value(), self.ground_y.value())
         except (ValueError, cv2.error) as exc:
             QMessageBox.warning(self, "平地验证", str(exc)); return
-        root = Path(__file__).resolve().parents[1]
-        save_flat_validation(root / "tools" / "calibration" / "output" / "flat_plane_validation.json",
+        save_flat_validation(CALIBRATION_OUTPUT_DIRECTORY / "flat_plane_validation.json",
                              self.intrinsic_result, h, errors, self.calib_cols.value(), self.calib_rows.value(),
                              self.calib_square_mm.value(), self.ground_x.value(), self.ground_y.value())
         self.lbl_ground_status.setText(f"E/F 验证误差：{errors[0]*1000:.1f} / {errors[1]*1000:.1f} mm（仅保存验证，不参与循迹）。")
@@ -2503,8 +2698,9 @@ class MainWindow(QMainWindow):
             self.on_udp_stats(text)
 
     def _render_latest_display_frame(self):
-        if isinstance(self.worker, UdpStreamWorker):
-            image = self.worker.take_latest_frame()
+        worker = self.worker
+        if worker is not None and hasattr(worker, "take_latest_frame"):
+            image = worker.take_latest_frame()
             if image is not None:
                 self._pending_display_frame = image
         image = self._pending_display_frame
@@ -2525,7 +2721,14 @@ class MainWindow(QMainWindow):
         self.lbl_resolution.setText(f"Resolution: {img.shape[1]}x{img.shape[0]}")
         self.lbl_frame_size.setText(f"Frame size: {img.nbytes // 1024} KB")
 
-        if hasattr(self, "calib_preview") and self.calibration_frozen_frame is None:
+        # Calibration preview needs another full image conversion and scale.
+        # It is unnecessary while another tab is visible, and 5 Hz is ample
+        # for manually placing calibration points.
+        now = time.monotonic()
+        if (hasattr(self, "calib_preview") and self.calibration_frozen_frame is None
+                and self.tabs.currentWidget() is self.calibration_tab
+                and now - self._last_calibration_preview_monotonic >= 0.20):
+            self._last_calibration_preview_monotonic = now
             self._refresh_calibration_preview()
 
         # Rendering only the visible image tab halves conversion/scaling load.
@@ -2570,7 +2773,7 @@ class MainWindow(QMainWindow):
 
         pixmap = QPixmap.fromImage(qimg)
         scaled = pixmap.scaled(
-            label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+            label.size(), Qt.KeepAspectRatio, Qt.FastTransformation
         )
         label.setPixmap(scaled)
 

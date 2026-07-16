@@ -34,6 +34,9 @@ namespace balance_car::config
   {
     uint16_t manualTestDurationMs;
     float manualTestPower;
+    // Absolute upper limit for a host-driven wheel-suspended test.  This is
+    // intentionally separate from the normal balance output limit.
+    float manualTestMaximumPower;
     uint16_t offlineArmHoldMs;
     float balanceStartAngleLimitDegrees;
     float balanceFaultAngleDegrees;
@@ -132,7 +135,7 @@ namespace balance_car::config
 
   constexpr EncoderConfiguration kEncoderConfiguration = {
       // Measured with the current A-phase CHANGE interrupt counting method.
-      .countsPerWheelRevolution = 530.0F,
+      .countsPerWheelRevolution = 466.0F,
       .wheelDiameterMeters = 0.064F,
       .useInternalPullups = true,
       .leftDirectionInverted = false,
@@ -152,6 +155,7 @@ namespace balance_car::config
   constexpr SafetyConfiguration kSafetyConfiguration = {
       .manualTestDurationMs = 1000,
       .manualTestPower = 0.15F,
+      .manualTestMaximumPower = 0.35F,
       .offlineArmHoldMs = 1500,
       .balanceStartAngleLimitDegrees = 30.0F,
       .balanceFaultAngleDegrees = 60.0F,
@@ -188,7 +192,9 @@ namespace balance_car::config
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
       .derivativeGain = 0.003F,
-      .integralLimit = 5000.0F,
+      // The balance integrator is expressed in degree-seconds.  This keeps
+      // the former 5000 samples at a 5 ms loop equivalent to 25 deg·s.
+      .integralLimit = 25.0F,
       .maximumMotorCommand = 0.45F,
       .motorOutputInverted = false,
   };
@@ -226,7 +232,9 @@ namespace balance_car::config
 
   constexpr MotionConfiguration kMotionConfiguration = {
       .maximumTargetSpeedMps = 0.25F,
-      .initialTargetSpeedMps = 0.06F,
+      // Arming starts in place.  Forward motion must be commanded explicitly
+      // after the balance and safety checks have completed.
+      .initialTargetSpeedMps = 0.0F,
       .targetSpeedStepMps = 0.05F,
       // Target right-minus-left wheel speed for differential steering, in m/s.
       .maximumTurnCommand = 0.20F,

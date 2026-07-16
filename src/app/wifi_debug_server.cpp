@@ -12,7 +12,7 @@ namespace balance_car::app
 namespace
 {
 constexpr size_t kCommandBufferCapacity = 128;
-constexpr size_t kTelemetryBufferCapacity = 512;
+constexpr size_t kTelemetryBufferCapacity = 640;
 
 bool isAllowedParameter(const char *domain, const char *parameter)
 {
@@ -172,9 +172,10 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
 
   _lastTelemetryMs = nowMs;
   char packet[kTelemetryBufferCapacity] = {};
+  const uint32_t telemetrySequence = _telemetrySequence++;
   const int length = snprintf(
       packet, sizeof(packet),
-      "T,9,%lu,%lu,%u,%u,%u,"
+      "T,10,%lu,%lu,%u,%u,%u,"
       "%.3f,%.3f,%.3f,"       // pitch, pitch rate, accelerometer pitch
       "%.3f,%.3f,%.3f,"       // accelerometer X/Y/Z
       "%.3f,%.3f,%.3f,"       // gyro X/Y/Z
@@ -193,8 +194,9 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       "%.5f,%u,"               // raw balance motor command, speed output inverted
       "%.5f,%.5f,%.3f,%u,"    // turn Kp/Ki/max command, output inverted
       "%.3f,%.3f,"             // relative heading, filtered yaw rate
-      "%u,%u,%u,%.3f,%u,%u,%u\n", // vision enabled, fresh sample, accepted, camera delta-v, update period/filter/max-step
-      static_cast<unsigned long>(_telemetrySequence++),
+      "%u,%u,%u,%.3f,%u,%u,%u," // vision enabled, fresh sample, accepted, camera delta-v, update period/filter/max-step
+      "%u,%u,%u,%u,%u,%u,%u\n", // saturation flags, encoder/IMU validity, actual loop periods
+      static_cast<unsigned long>(telemetrySequence),
       static_cast<unsigned long>(telemetry.timestampMs),
       static_cast<unsigned int>(telemetry.safetyState),
       static_cast<unsigned int>(telemetry.faultCode),
@@ -224,7 +226,14 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
       telemetry.visionDeltaSpeedMps,
       static_cast<unsigned int>(telemetry.visionTargetUpdatePeriodMs),
       telemetry.visionTargetFilterEnabled ? 1U : 0U,
-      static_cast<unsigned int>(telemetry.visionTargetMaximumStepMmps));
+      static_cast<unsigned int>(telemetry.visionTargetMaximumStepMmps),
+      telemetry.balanceInnerSaturated ? 1U : 0U,
+      telemetry.velocityLoopSaturated ? 1U : 0U,
+      telemetry.turnLoopSaturated ? 1U : 0U,
+      telemetry.encoderValid ? 1U : 0U,
+      telemetry.imuCalibrated ? 1U : 0U,
+      static_cast<unsigned int>(telemetry.balanceControlPeriodMs),
+      static_cast<unsigned int>(telemetry.velocityControlPeriodMs));
   if (length <= 0 || length >= static_cast<int>(sizeof(packet)))
   {
     return;
@@ -242,6 +251,27 @@ void WifiDebugServer::publish(const WifiTelemetry &telemetry, uint32_t nowMs)
   else
   {
     ++_telemetryFailuresSinceDiagnostics;
+  }
+
+  // D,1 is deliberately a separate, compact diagnostics packet.  T,10 must
+  // remain byte-for-byte compatible with the existing tuning hosts, whereas
+  // characterization needs signed cumulative ticks and the 40 ms tick delta.
+  char diagnosticsPacket[240] = {};
+  const int diagnosticsLength = snprintf(
+      diagnosticsPacket, sizeof(diagnosticsPacket),
+      "D,1,%lu,%lu,%ld,%ld,%ld,%ld,%.3f,%.3f\n",
+      static_cast<unsigned long>(telemetrySequence),
+      static_cast<unsigned long>(telemetry.timestampMs),
+      static_cast<long>(telemetry.leftEncoderTicks),
+      static_cast<long>(telemetry.rightEncoderTicks),
+      static_cast<long>(telemetry.leftEncoderTickDelta),
+      static_cast<long>(telemetry.rightEncoderTickDelta),
+      telemetry.leftEncoderTicksPerSecond, telemetry.rightEncoderTicksPerSecond);
+  if (diagnosticsLength > 0 && diagnosticsLength < static_cast<int>(sizeof(diagnosticsPacket)))
+  {
+    _udp.beginPacket(targetIp, targetPort);
+    _udp.write(reinterpret_cast<const uint8_t *>(diagnosticsPacket), static_cast<size_t>(diagnosticsLength));
+    _udp.endPacket();
   }
   if (nowMs - _lastTelemetryDiagnosticsMs >= 1000)
   {
@@ -418,6 +448,40 @@ bool WifiDebugServer::parseCommand(char *packet, size_t length)
       }
       _pendingCommand.kind = WifiCommandKind::Track;
       _pendingCommand.value = strcmp(enabledText, "1") == 0 ? 1.0F : 0.0F;
+    }
+    else if (strcmp(action, "motor") == 0)
+    {
+      char *leftText = strtok_r(nullptr, ",", &context);
+      char *rightText = strtok_r(nullptr, ",", &context);
+      if (leftText == nullptr || rightText == nullptr || strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      char *leftEnd = nullptr;
+      char *rightEnd = nullptr;
+      const float leftPower = strtof(leftText, &leftEnd);
+      const float rightPower = strtof(rightText, &rightEnd);
+      // This parser-side bound is repeated by SafetyManager.  Keeping both
+      // makes malformed or future call sites unable to bypass the limit.
+      if (*leftText == '\0' || *rightText == '\0' || *leftEnd != '\0' || *rightEnd != '\0' ||
+          !isfinite(leftPower) || !isfinite(rightPower) || fabsf(leftPower) > 0.35F || fabsf(rightPower) > 0.35F)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "MOTOR_RANGE");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::MotorTest;
+      _pendingCommand.value = leftPower;
+      _pendingCommand.value2 = rightPower;
+    }
+    else if (strcmp(action, "imu_cal") == 0)
+    {
+      if (strtok_r(nullptr, ",", &context) != nullptr)
+      {
+        sendReply(static_cast<uint32_t>(sequence), "ERR", "FORMAT");
+        return false;
+      }
+      _pendingCommand.kind = WifiCommandKind::CalibrateImu;
     }
     else
     {

@@ -17,6 +17,11 @@ enum class WifiCommandKind : uint8_t
   Drive,
   Turn,
   Track,
+  // Wheel-suspended characterization only.  The SafetyManager constrains
+  // both magnitude and duration; this is never available while balancing.
+  MotorTest,
+  // Re-runs the stationary gyro-bias routine while the vehicle is in standby.
+  CalibrateImu,
 };
 
 struct WifiTuningCommand
@@ -26,6 +31,7 @@ struct WifiTuningCommand
   char domain[16] = {};
   char parameter[16] = {};
   float value = 0.0F;
+  float value2 = 0.0F;
 };
 
 struct WifiTelemetry
@@ -85,6 +91,22 @@ struct WifiTelemetry
   uint16_t visionTargetUpdatePeriodMs = 0;
   bool visionTargetFilterEnabled = false;
   uint16_t visionTargetMaximumStepMmps = 0;
+  // T,10 diagnostics for tuning validation.
+  bool balanceInnerSaturated = false;
+  bool velocityLoopSaturated = false;
+  bool turnLoopSaturated = false;
+  bool encoderValid = false;
+  bool imuCalibrated = false;
+  uint16_t balanceControlPeriodMs = 0;
+  uint16_t velocityControlPeriodMs = 0;
+  // Raw encoder data is emitted in the companion D,1 packet.  Keeping it out
+  // of T,10 preserves compatibility with existing desktop tuners.
+  int32_t leftEncoderTicks = 0;
+  int32_t rightEncoderTicks = 0;
+  int32_t leftEncoderTickDelta = 0;
+  int32_t rightEncoderTickDelta = 0;
+  float leftEncoderTicksPerSecond = 0.0F;
+  float rightEncoderTicksPerSecond = 0.0F;
 };
 
 // Wi-Fi transport only: it has no knowledge of motors, arming, or control laws.

@@ -9,6 +9,10 @@
 !/tool/**
 # Runtime speed telemetry recordings produced by the host application.
 /tool/records/
+# Runtime I2C diagnostics and locally generated camera calibration results.
+/tool/log/
+/tool/calibration/output/
+/tool/**/__pycache__/
 !/include/
 !/include/**
 !/lib/

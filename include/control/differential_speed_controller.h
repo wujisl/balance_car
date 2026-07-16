@@ -19,6 +19,8 @@ struct DifferentialSpeedState
   float integralMpsSeconds = 0.0F;
   float turnMotorCommandRaw = 0.0F;
   float turnMotorCommand = 0.0F;
+  float appliedTurnMotorCommand = 0.0F;
+  bool saturated = false;
 };
 
 // Generates a steering motor command from the right-minus-left wheel-speed
@@ -31,7 +33,7 @@ public:
 
   void reset();
   float update(float targetDifferentialSpeedMps, float leftSpeedMps, float rightSpeedMps,
-               float deltaSeconds);
+               float deltaSeconds, float appliedTurnMotorCommand);
   void setProportionalGain(float gain);
   void setIntegralGain(float gain);
   void setMaximumTurnMotorCommand(float maximumTurnMotorCommand);

@@ -1,6 +1,7 @@
 # ESP32-S3 平衡小车上位机依赖
-# 安装方式：
-#   d:\workspace\balance_camera\venv_host\Scripts\python.exe -m pip install -r tools/requirements.txt
+# 安装方式（在项目根目录执行）：
+#   .\.venv\Scripts\python.exe -m pip install -r tool\requirements.txt
+# calibration 是随本项目 tool/calibration 一起提供的本地模块，无需 pip 安装。
 
 PyQt5>=5.15.0
 opencv-python>=4.8.0

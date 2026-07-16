@@ -142,6 +142,8 @@ namespace
   bool wifiDriveSlewActive = false;
   uint32_t lastControlUpdateMs = 0;
   uint32_t lastVelocityUpdateMs = 0;
+  uint16_t latestBalanceControlPeriodMs = 0;
+  uint16_t latestVelocityControlPeriodMs = 0;
   uint32_t lastTelemetryMs = 0;
   uint32_t lastVisionI2cMs = 0;
   uint16_t visionChassisSequence = 0;
@@ -813,6 +815,39 @@ namespace
         Serial.println("[WIFI] MOTOR_OUTPUT=STOPPED");
         wifiDebugServer.sendCommandResult(command.requestSequence, true, "STOPPED");
       }
+      else if (command.kind == balance_car::app::WifiCommandKind::MotorTest)
+      {
+        // The SafetyManager admits this only from STANDBY/MANUAL_TEST, limits
+        // its magnitude, and drops motor enable after a one-second heartbeat
+        // timeout.  The desktop host refreshes the command while a test runs.
+        const bool accepted = safetyManager.requestManualMotorTest(
+            command.value, command.value2, millis());
+        if (accepted)
+        {
+          latestMixedMotorCommand.left = command.value;
+          latestMixedMotorCommand.right = command.value2;
+          latestBalanceMotorCommand = 0.0F;
+          latestTurnMotorCommand = 0.0F;
+        }
+        wifiDebugServer.sendCommandResult(command.requestSequence, accepted,
+                                          accepted ? "MOTOR_TEST_ACTIVE" : "MOTOR_TEST_REJECTED");
+      }
+      else if (command.kind == balance_car::app::WifiCommandKind::CalibrateImu)
+      {
+        // This operation samples for approximately one second, so it must be
+        // performed with the vehicle motionless and motors disabled.
+        const bool inStandby = safetyManager.state() == balance_car::app::SafetyState::Standby;
+        const bool calibrated = inStandby && imuDriver.calibrateGyroscope();
+        if (calibrated)
+        {
+          attitudeEstimator.reset();
+          latestImuSample = imuDriver.read();
+          latestAttitude = attitudeEstimator.update(latestImuSample, true);
+        }
+        wifiDebugServer.sendCommandResult(command.requestSequence, calibrated,
+                                          calibrated ? "GYRO_CALIBRATED" :
+                                                       (inStandby ? "GYRO_NOT_STATIONARY" : "NOT_STANDBY"));
+      }
       else if (command.kind == balance_car::app::WifiCommandKind::Reset)
       {
         // Match a physical RESET press: stop the current process and restart
@@ -941,6 +976,12 @@ namespace
     telemetry.rightMotorCommand = latestMixedMotorCommand.right;
     telemetry.leftWheelSpeedMps = latestWheelSpeed.leftMetersPerSecond;
     telemetry.rightWheelSpeedMps = latestWheelSpeed.rightMetersPerSecond;
+    telemetry.leftEncoderTicks = latestWheelSpeed.leftTicks;
+    telemetry.rightEncoderTicks = latestWheelSpeed.rightTicks;
+    telemetry.leftEncoderTickDelta = latestWheelSpeed.leftTickDelta;
+    telemetry.rightEncoderTickDelta = latestWheelSpeed.rightTickDelta;
+    telemetry.leftEncoderTicksPerSecond = latestWheelSpeed.leftTicksPerSecond;
+    telemetry.rightEncoderTicksPerSecond = latestWheelSpeed.rightTicksPerSecond;
     telemetry.requestedPitchDegrees = balanceState.requestedPitchDegrees;
     telemetry.balancePitchErrorDegrees = balanceState.pitchErrorDegrees;
     telemetry.balanceProportionalTerm = balanceState.proportionalTerm;
@@ -969,6 +1010,13 @@ namespace
     telemetry.visionTargetUpdatePeriodMs = static_cast<uint16_t>(visionTargetUpdatePeriodMs);
     telemetry.visionTargetFilterEnabled = visionTargetFilterEnabled;
     telemetry.visionTargetMaximumStepMmps = visionTargetMaximumStepMmps;
+    telemetry.balanceInnerSaturated = balanceState.saturated;
+    telemetry.velocityLoopSaturated = velocityState.saturated;
+    telemetry.turnLoopSaturated = turnState.saturated;
+    telemetry.encoderValid = encoderDriver.isInitialized();
+    telemetry.imuCalibrated = imuDriver.isCalibrated();
+    telemetry.balanceControlPeriodMs = latestBalanceControlPeriodMs;
+    telemetry.velocityControlPeriodMs = latestVelocityControlPeriodMs;
     wifiDebugServer.publish(telemetry, nowMs);
   }
 
@@ -981,6 +1029,7 @@ namespace
 
     const uint32_t elapsedMs = nowMs - lastVelocityUpdateMs;
     lastVelocityUpdateMs = nowMs;
+    latestVelocityControlPeriodMs = static_cast<uint16_t>(elapsedMs > 65535U ? 65535U : elapsedMs);
     latestWheelSpeed = encoderDriver.sample(static_cast<float>(elapsedMs) / 1000.0F);
     if (!safetyManager.isBalancing() || !airborneLandingManager.allowMotionControl())
     {
@@ -999,7 +1048,8 @@ namespace
         motionCommand.targetSpeedMps(), measuredSpeedMps, static_cast<float>(elapsedMs) / 1000.0F);
     latestTurnMotorCommand = differentialSpeedController.update(
         motionCommand.targetDifferentialSpeedMps(), latestWheelSpeed.leftMetersPerSecond,
-        latestWheelSpeed.rightMetersPerSecond, static_cast<float>(elapsedMs) / 1000.0F);
+        latestWheelSpeed.rightMetersPerSecond, static_cast<float>(elapsedMs) / 1000.0F,
+        latestMixedMotorCommand.appliedTurnCommand);
     differentialOdometry.update(latestWheelSpeed, static_cast<float>(elapsedMs) / 1000.0F);
   }
 
@@ -1192,7 +1242,9 @@ namespace
       return;
     }
 
+    const uint32_t elapsedMs = nowMs - lastControlUpdateMs;
     lastControlUpdateMs = nowMs;
+    latestBalanceControlPeriodMs = static_cast<uint16_t>(elapsedMs > 65535U ? 65535U : elapsedMs);
     latestImuSample = imuDriver.read();
     handleAirborneLandingEvent(airborneLandingManager.update(latestImuSample, nowMs));
     latestAttitude = attitudeEstimator.update(
@@ -1217,7 +1269,8 @@ namespace
       return;
     }
 
-    latestBalanceMotorCommand = balanceController.update(latestAttitude, latestVelocityPitchOffsetDegrees);
+    latestBalanceMotorCommand = balanceController.update(
+        latestAttitude, latestVelocityPitchOffsetDegrees, static_cast<float>(elapsedMs) / 1000.0F);
     latestMixedMotorCommand = balance_car::control::MotorMixer::mix(
         latestBalanceMotorCommand, latestTurnMotorCommand,
         balanceController.tuning().maximumMotorCommand * airborneLandingManager.motorOutputScale(nowMs));

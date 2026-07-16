@@ -23,6 +23,7 @@ struct BalanceState
   float integralTerm = 0.0F;
   float derivativeTerm = 0.0F;
   float motorCommandRaw = 0.0F;
+  bool saturated = false;
 };
 
 class BalanceController
@@ -31,7 +32,7 @@ public:
   explicit BalanceController(const config::BalanceConfiguration &configuration);
 
   void reset();
-  float update(const AttitudeState &attitude, float velocityPitchOffsetDegrees);
+  float update(const AttitudeState &attitude, float velocityPitchOffsetDegrees, float deltaSeconds);
   void setProportionalGain(float gain);
   void setIntegralGain(float gain);
   void setDerivativeGain(float gain);
@@ -44,6 +45,6 @@ private:
   const config::BalanceConfiguration &_configuration;
   BalanceTuning _tuning;
   BalanceState _state;
-  float _integralDegrees = 0.0F;
+  float _integralDegreesSeconds = 0.0F;
 };
 } // namespace balance_car::control

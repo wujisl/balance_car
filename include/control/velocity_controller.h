@@ -18,6 +18,7 @@ struct VelocityState
   float speedErrorMps = 0.0F;
   float integralMpsSeconds = 0.0F;
   float pitchOffsetDegrees = 0.0F;
+  bool saturated = false;
 };
 
 class VelocityController

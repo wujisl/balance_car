@@ -39,22 +39,36 @@ float VelocityController::update(float targetSpeedMps, float measuredSpeedMps, f
   }
 
   _state.speedErrorMps = targetSpeedMps - _state.filteredSpeedMps;
-  _state.integralMpsSeconds += _state.speedErrorMps * deltaSeconds;
-  if (_state.integralMpsSeconds > _configuration.integralLimit)
+  float candidateIntegral = _state.integralMpsSeconds + _state.speedErrorMps * deltaSeconds;
+  if (candidateIntegral > _configuration.integralLimit)
   {
-    _state.integralMpsSeconds = _configuration.integralLimit;
+    candidateIntegral = _configuration.integralLimit;
   }
-  else if (_state.integralMpsSeconds < -_configuration.integralLimit)
+  else if (candidateIntegral < -_configuration.integralLimit)
   {
-    _state.integralMpsSeconds = -_configuration.integralLimit;
+    candidateIntegral = -_configuration.integralLimit;
   }
 
-  float pitchOffsetDegrees = _tuning.proportionalGain * _state.speedErrorMps +
-                             _tuning.integralGain * _state.integralMpsSeconds;
+  const float proportionalTerm = _tuning.proportionalGain * _state.speedErrorMps;
+  const float candidateOutput = proportionalTerm + _tuning.integralGain * candidateIntegral;
+  const bool saturatedHigh = candidateOutput > _tuning.maximumPitchOffsetDegrees &&
+                             _state.speedErrorMps > 0.0F;
+  const bool saturatedLow = candidateOutput < -_tuning.maximumPitchOffsetDegrees &&
+                            _state.speedErrorMps < 0.0F;
+  if (!saturatedHigh && !saturatedLow)
+  {
+    _state.integralMpsSeconds = candidateIntegral;
+  }
+
+  const float logicalPitchOffsetDegrees = proportionalTerm +
+                                          _tuning.integralGain * _state.integralMpsSeconds;
+  float pitchOffsetDegrees = logicalPitchOffsetDegrees;
   if (_tuning.outputInverted)
   {
     pitchOffsetDegrees = -pitchOffsetDegrees;
   }
+  _state.saturated = logicalPitchOffsetDegrees > _tuning.maximumPitchOffsetDegrees ||
+                     logicalPitchOffsetDegrees < -_tuning.maximumPitchOffsetDegrees;
   if (pitchOffsetDegrees > _tuning.maximumPitchOffsetDegrees)
   {
     pitchOffsetDegrees = _tuning.maximumPitchOffsetDegrees;

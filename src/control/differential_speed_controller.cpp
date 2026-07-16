@@ -1,5 +1,7 @@
 #include "control/differential_speed_controller.h"
 
+#include <math.h>
+
 namespace balance_car::control
 {
 namespace
@@ -22,7 +24,8 @@ void DifferentialSpeedController::reset()
 }
 
 float DifferentialSpeedController::update(float targetDifferentialSpeedMps, float leftSpeedMps,
-                                          float rightSpeedMps, float deltaSeconds)
+                                          float rightSpeedMps, float deltaSeconds,
+                                          float appliedTurnMotorCommand)
 {
   if (deltaSeconds <= 0.0F)
   {
@@ -44,6 +47,7 @@ float DifferentialSpeedController::update(float targetDifferentialSpeedMps, floa
 
   _state.differentialSpeedErrorMps =
       targetDifferentialSpeedMps - _state.filteredDifferentialSpeedMps;
+  _state.appliedTurnMotorCommand = appliedTurnMotorCommand;
 
   // Integrate only when the candidate output does not push farther into
   // saturation. This prevents a queued turn command after a sharp disturbance.
@@ -55,7 +59,17 @@ float DifferentialSpeedController::update(float targetDifferentialSpeedMps, floa
   const float outputLimit = _tuning.maximumTurnMotorCommand;
   const bool saturatedHigh = candidateOutput > outputLimit && _state.differentialSpeedErrorMps > 0.0F;
   const bool saturatedLow = candidateOutput < -outputLimit && _state.differentialSpeedErrorMps < 0.0F;
-  if (!saturatedHigh && !saturatedLow)
+  // The mixer can reduce the requested turn when the balance command needs
+  // motor headroom.  Feed that real applied output from the previous inner
+  // loop back into the outer turn integrator so it cannot wind up against
+  // unavailable steering authority.
+  const float previousLogicalCommand = _tuning.outputInverted ? -_state.turnMotorCommand
+                                                               : _state.turnMotorCommand;
+  const bool mixerLimited = fabsf(appliedTurnMotorCommand - _state.turnMotorCommand) > 0.001F;
+  const bool mixerBlocksFurther = mixerLimited &&
+      ((_state.differentialSpeedErrorMps > 0.0F && previousLogicalCommand > 0.0F) ||
+       (_state.differentialSpeedErrorMps < 0.0F && previousLogicalCommand < 0.0F));
+  if (!saturatedHigh && !saturatedLow && !mixerBlocksFurther)
   {
     _state.integralMpsSeconds = candidateIntegral;
   }
@@ -67,6 +81,7 @@ float DifferentialSpeedController::update(float targetDifferentialSpeedMps, floa
   }
   _state.turnMotorCommandRaw = turnMotorCommand;
   _state.turnMotorCommand = clamp(turnMotorCommand, outputLimit);
+  _state.saturated = turnMotorCommand > outputLimit || turnMotorCommand < -outputLimit || mixerLimited;
   return _state.turnMotorCommand;
 }
 

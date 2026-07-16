@@ -17,16 +17,16 @@ SelfTestReport SelfTest::run()
   report.imuReady = _imuDriver.begin();
   if (report.imuReady)
   {
-    // Do not require a stationary, multi-second gyro calibration at power-on.
-    // A valid first sample is enough to enter STANDBY; arming still checks
-    // current IMU health and the runtime monitor remains active.
+    // Startup only requires the IMU to return one valid sample.  A stationary
+    // gyro calibration remains available as an explicit maintenance action;
+    // it must not prevent the vehicle from entering STANDBY at power-on.
     report.imuSampleValid = _imuDriver.read().valid;
     report.imuModel = _imuDriver.model();
     report.imuAddress = _imuDriver.address();
   }
 
   // Motor/encoder begin results remain visible for diagnosis, but do not lock
-  // out balancing.  The minimum safe startup condition is a readable IMU.
+  // out balancing.  The minimum startup condition is a readable IMU sample.
   report.passed = report.imuReady && report.imuSampleValid;
   return report;
 }
