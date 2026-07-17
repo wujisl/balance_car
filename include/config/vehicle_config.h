@@ -191,7 +191,7 @@ namespace balance_car::config
       // Start tuning with P-D control only. Enable a small Ki only after the
       // mechanical trim has been verified on the actual vehicle.
       .integralGain = 0.0F,
-      .derivativeGain = 0.02F,
+      .derivativeGain = 0.002F,
       // The balance integrator is expressed in degree-seconds.  This keeps
       // the former 5000 samples at a 5 ms loop equivalent to 25 deg·s.
       .integralLimit = 25.0F,

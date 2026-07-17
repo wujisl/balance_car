@@ -1434,6 +1434,8 @@ class VehicleTuningOverview(QWidget):
         self.vision_period_spin.setToolTip(
             "0 表示每个新 camera 包都更新；40 ms 与当前转差环周期一致。"
         )
+        self.vision_period_spin.setKeyboardTracking(False)
+        self.vision_period_spin.editingFinished.connect(self._commit_vision_period_editor)
         vision_grid.addWidget(self.vision_period_spin, 0, 1)
         vision_grid.addWidget(QLabel("单次转差最大变化 (mm/s，0=不限):"), 0, 2)
         self.vision_max_step_spin = self._spin(0.0, 200.0, 0.0, 0, 5.0)
@@ -1450,6 +1452,9 @@ class VehicleTuningOverview(QWidget):
         self.btn_apply_vision = QPushButton("应用视觉循迹参数")
         self.btn_apply_vision.clicked.connect(self.apply_vision)
         vision_grid.addWidget(self.btn_apply_vision, 2, 2, 1, 2)
+        self.vision_period_status = QLabel("更新间隔：等待设备回读")
+        self.vision_period_status.setStyleSheet("color:#4b5b6b;")
+        vision_grid.addWidget(self.vision_period_status, 2, 4, 1, 2)
         vision_note = QLabel(
             "当前 T,10 会回读更新间隔、加权滤波和最大变化；失线保持开关/幅值只会在本次下发 ACK 后确认。"
             "失线保持可能让车辆在黑线长时间丢失时继续转向，必须测试后再用于实际场地。"
@@ -1479,6 +1484,20 @@ class VehicleTuningOverview(QWidget):
 
     def reset_parameter_load(self):
         self._vision_loaded = False
+        self.vision_period_status.setText("更新间隔：等待设备回读")
+        self.vision_period_status.setStyleSheet("color:#4b5b6b;")
+
+    def _commit_vision_period_editor(self) -> float:
+        """Commit text still being edited before the Apply button reads it."""
+        editor_text = self.vision_period_spin.lineEdit().text().strip()
+        self.vision_period_spin.interpretText()
+        value = float(round(self.vision_period_spin.value()))
+        self.vision_period_spin.setValue(value)
+        self.vision_period_status.setText(
+            f"更新间隔：待应用 {int(value)} ms（输入：{editor_text or '-'}）"
+        )
+        self.vision_period_status.setStyleSheet("color:#b36b00;")
+        return value
 
     def consume_telemetry(self, telemetry: dict):
         if telemetry.get("balance_saturated") is None:
@@ -1499,6 +1518,10 @@ class VehicleTuningOverview(QWidget):
             return
         if telemetry.get("vision_period") is not None:
             self.vision_period_spin.setValue(telemetry["vision_period"])
+            self.vision_period_status.setText(
+                f"更新间隔：设备当前 {int(round(telemetry['vision_period']))} ms"
+            )
+            self.vision_period_status.setStyleSheet("color:#16803c;")
         if telemetry.get("vision_max_step") is not None:
             self.vision_max_step_spin.setValue(telemetry["vision_max_step"])
         if telemetry.get("vision_filter") is not None:
@@ -1509,6 +1532,10 @@ class VehicleTuningOverview(QWidget):
     def confirm_parameter(self, parameter: str, value: float):
         if parameter == "period_ms":
             self.vision_period_spin.setValue(value)
+            self.vision_period_status.setText(
+                f"更新间隔：ACK 已确认 {int(round(value))} ms"
+            )
+            self.vision_period_status.setStyleSheet("color:#16803c;")
         elif parameter == "max_step_mmps":
             self.vision_max_step_spin.setValue(value)
         elif parameter == "filter":
@@ -1519,8 +1546,9 @@ class VehicleTuningOverview(QWidget):
             self.vision_curve_hold_spin.setValue(value)
 
     def apply_vision(self):
+        requested_period = self._commit_vision_period_editor()
         fields = (
-            ("period_ms", self.vision_period_spin.value()),
+            ("period_ms", requested_period),
             ("max_step_mmps", self.vision_max_step_spin.value()),
             ("filter", 1.0 if self.vision_filter_check.isChecked() else 0.0),
             ("curve_hold", 1.0 if self.vision_curve_hold_check.isChecked() else 0.0),
@@ -1887,6 +1915,22 @@ class TuningMainWindow(QMainWindow):
             self.on_error(f"参数 ACK 数值异常：{fields[3]}")
             return
         domain, parameter = result[1], result[2]
+        requested_domain = str(pending.get("domain", ""))
+        requested_parameter = str(pending.get("parameter", ""))
+        requested_value = float(pending.get("value", 0.0))
+        if domain != requested_domain or parameter != requested_parameter:
+            self.on_error(
+                "参数 ACK 与请求不匹配："
+                f"请求 {requested_domain}.{requested_parameter}，"
+                f"回读 {domain}.{parameter}"
+            )
+            return
+        if parameter == "period_ms" and abs(actual_value - requested_value) > 0.5:
+            self.vehicle_page.confirm_parameter(parameter, actual_value)
+            self.on_error(
+                f"更新间隔未按请求生效：请求 {requested_value:.0f} ms，"
+                f"主板回读 {actual_value:.0f} ms；请确认已烧录支持 0–60000 ms 的固件"
+            )
         page = {
             "balance": self.balance_page,
             "speed": self.speed_page,
